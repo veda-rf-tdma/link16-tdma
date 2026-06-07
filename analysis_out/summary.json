@@ -1,0 +1,16 @@
+{
+  "sample_count": 18,
+  "frame_count": 6,
+  "anchor_node_ids": [
+    "0x21",
+    "0x22",
+    "0x23"
+  ],
+  "apollonius_pair_count": 18,
+  "outputs": [
+    "normalized_rssi.csv",
+    "drop_events.csv",
+    "apollonius_candidates.csv",
+    "ekf_observations.csv"
+  ]
+}

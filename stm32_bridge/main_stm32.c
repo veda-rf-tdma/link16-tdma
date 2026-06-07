@@ -1,0 +1,612 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "cc1101_regs.h"
+#include "cc1101_stm32.h"
+#include "tdma_runtime.h"
+#include "config.h"
+#include "protocol.h"
+#include "radio_metrics.h"
+#include "ekf.h"
+
+/* 
+ * STM32 HAL Type Definitions and Stubs for reference compilation.
+ * In the actual STM32CubeMX generated project, these are defined in "stm32f4xx_hal.h"
+ */
+#ifndef HAL_OK
+typedef uint32_t HAL_StatusTypeDef;
+#define HAL_OK      0x00U
+#define HAL_ERROR   0x01U
+#define HAL_BUSY    0x02U
+#define HAL_TIMEOUT 0x03U
+#endif
+
+#ifndef GPIO_PIN_RESET
+#define GPIO_PIN_RESET 0
+#define GPIO_PIN_SET   1
+#endif
+
+#ifndef GPIO_PIN_0
+#define GPIO_PIN_0 1
+#define GPIO_PIN_4 4
+#endif
+
+/* Mock HAL GPIO definitions if not defined in stm32f4xx_hal.h */
+#ifndef GPIOA
+#define GPIOA ((void*)0x40020000)
+#define GPIOC ((void*)0x40020800)
+#define GPIO_PIN_5   ((uint16_t)0x0020) /* PA5 LED */
+#define GPIO_PIN_13  ((uint16_t)0x2000) /* PC13 Button */
+#endif
+
+#ifndef HAL_GPIO_ReadPin
+typedef uint8_t GPIO_PinState;
+static inline GPIO_PinState HAL_GPIO_ReadPin(void* port, uint16_t pin) {
+    (void)port; (void)pin;
+    return 1; /* Default unpressed state (pull-up high) */
+}
+static inline void HAL_GPIO_WritePin(void* port, uint16_t pin, GPIO_PinState state) {
+    (void)port; (void)pin; (void)state;
+}
+#endif
+
+/* Standard CubeMX device structures (placeholders) */
+typedef struct {
+    int dummy;
+} SPI_HandleTypeDef;
+
+typedef struct {
+    int dummy;
+} TIM_HandleTypeDef;
+
+extern SPI_HandleTypeDef hspi1;
+extern TIM_HandleTypeDef htim2; /* Configured for 1 MHz clock (1 tick = 1 us) */
+
+static cc1101_t radio;
+static tdma_clock_t tdma_clock;
+static tdma_runtime_t tdma_runtime;
+static ekf_t ekf_inst;
+
+/* Dynamic frame period tuner variables (used on Master node) */
+typedef enum {
+    TUNING_SWEEP,
+    TUNING_LOCKED
+} tuning_state_t;
+
+static tuning_state_t tuner_state = TUNING_SWEEP;
+static uint32_t tuner_frame_count = 0;
+static uint32_t tuner_rx_aircraft_packets = 0;
+static uint32_t last_stable_frame_period = TDMA_FRAME_PERIOD_US;
+
+/* Liveness tracking for dynamic slot table compaction */
+static uint32_t last_rx_frame_aircraft = 0;
+static uint32_t last_rx_frame_anchor1 = 0;
+static uint32_t last_rx_frame_anchor2 = 0;
+static uint8_t current_active_mask = 0x0F; /* Bit 0: Master, Bit 1: Aircraft, Bit 2: Anchor 1, Bit 3: Anchor 2 */
+
+/* Anchor node manual control variables */
+static uint8_t anchor_enabled = 1; /* 1 = Enabled (ON), 0 = Disabled (OFF) */
+static uint8_t last_btn_state = 1;  /* PC13 is active-low (unpressed = 1) */
+
+/* Local tracking variables */
+static int16_t last_rx_x_cm = 0; /* Echoed coords stored by aircraft */
+static int16_t last_rx_y_cm = 0;
+
+/* Master node EKF and report collection caches */
+static uint8_t master_last_measured_rssi = 0;
+static uint8_t master_last_measured_lqi = 0;
+static uint8_t anchor_1_reported_rssi = 0;
+static uint8_t anchor_2_reported_rssi = 0;
+static int anchor_1_report_received = 0;
+static int anchor_2_report_received = 0;
+
+/* Anchor node local variables */
+static uint8_t anchor_measured_rssi = 0;
+static uint8_t anchor_measured_lqi = 0;
+static int anchor_has_measurement = 0;
+
+/* Low-level platform dependencies required by cc1101_stm32.h */
+void cc1101_platform_select(void)
+{
+    /* CSN Low (Active) */
+    /* HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET); */
+}
+
+void cc1101_platform_deselect(void)
+{
+    /* CSN High (Idle) */
+    /* HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET); */
+}
+
+void cc1101_platform_delay_ms(uint32_t ms)
+{
+    /* HAL_Delay(ms); */
+}
+
+int cc1101_platform_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
+{
+    (void)tx;
+    (void)rx;
+    (void)len;
+    return 0;
+}
+
+/**
+ * @brief Returns monotonic microseconds since boot.
+ * Configure TIM2 as a 32-bit upcounter ticking at 1 MHz.
+ */
+uint64_t get_monotonic_us(void)
+{
+    return 0;
+}
+
+/**
+ * @brief EXTI line detection callback for CC1101 GDO0 pin.
+ * In CubeMX, configure GDO0 pin (e.g. PB0) as EXTI rising/falling edge interrupt.
+ */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_0) {
+        tdma_runtime_on_gdo0_edge(&tdma_runtime);
+    }
+}
+
+/**
+ * @brief Helper to transmit telemetry/debug logs over UART or USB CDC.
+ */
+static void log_telemetry(const char *msg)
+{
+    (void)msg;
+}
+
+/**
+ * @brief Converts RSSI dBm to linear power scale for Apollonius calculation.
+ */
+static double dbm_to_linear(double dbm)
+{
+    return pow(10.0, dbm / 10.0);
+}
+
+/**
+ * @brief Executes EKF math cycle on the Master node after receiving reports
+ *        from anchors, then updates the beacon coordinates.
+ */
+static void run_master_ekf_cycle(void)
+{
+    /* Step 1: Predict using dynamic frame period */
+    double dt = (double)tdma_clock.frame_period_us / 1000000.0;
+    ekf_predict(&ekf_inst, dt);
+
+    /* Step 2: Convert cached RSSI measurements to Apollonius distance ratios */
+    double noise_floor_dbm = -104.5;
+    double alpha = 2.0;
+
+    double p_m = 0.0, p_a1 = 0.0, p_a2 = 0.0;
+    int has_m = (master_last_measured_rssi > 0);
+    int has_a1 = anchor_1_report_received;
+    int has_a2 = anchor_2_report_received;
+
+    if (has_m) {
+        p_m = dbm_to_linear(cc1101_rssi_dbm(master_last_measured_rssi));
+    }
+    if (has_a1) {
+        p_a1 = dbm_to_linear(cc1101_rssi_dbm(anchor_1_reported_rssi));
+    }
+    if (has_a2) {
+        p_a2 = dbm_to_linear(cc1101_rssi_dbm(anchor_2_reported_rssi));
+    }
+
+    /* Step 3: Run EKF Updates sequentially for available pairs */
+    if (has_m && has_a1 && p_m > 0 && p_a1 > 0) {
+        double z_12 = pow(p_a1 / p_m, 1.0 / alpha);
+        ekf_update_apollonius(&ekf_inst, "0x21", "0x22", z_12);
+    }
+    if (has_m && has_a2 && p_m > 0 && p_a2 > 0) {
+        double z_13 = pow(p_a2 / p_m, 1.0 / alpha);
+        ekf_update_apollonius(&ekf_inst, "0x21", "0x23", z_13);
+    }
+    if (has_a1 && has_a2 && p_a1 > 0 && p_a2 > 0) {
+        double z_23 = pow(p_a2 / p_a1, 1.0 / alpha);
+        ekf_update_apollonius(&ekf_inst, "0x22", "0x23", z_23);
+    }
+
+    /* Save coordinates in global telemetry cache */
+    last_rx_x_cm = (int16_t)(ekf_inst.state[0] * 100.0);
+    last_rx_y_cm = (int16_t)(ekf_inst.state[1] * 100.0);
+
+    /* Reset reports for the next frame */
+    master_last_measured_rssi = 0;
+    anchor_1_report_received = 0;
+    anchor_2_report_received = 0;
+}
+
+/**
+ * @brief Handles packet reception, decodes the TDMA payload, 
+ *        triggers clock synchronization on beacons, and logs the outcome.
+ */
+static void process_received_packet(void)
+{
+    uint8_t rx_buf[96];
+    uint8_t rssi_raw = 0;
+    uint8_t lqi_raw = 0;
+    
+    int len = cc1101_poll_packet(&radio, rx_buf, sizeof(rx_buf), &rssi_raw, &lqi_raw);
+    if (len <= 0) {
+        return;
+    }
+    
+    /* rx_buf[0] is the CC1101 destination address byte. Actual payload starts at rx_buf[1]. */
+    tdma_packet_t packet;
+    int rc = tdma_decode_payload(rx_buf + 1, (size_t)(len - 1), &packet);
+    if (rc != 0) {
+        return;
+    }
+    
+    double rssi_dbm = cc1101_rssi_dbm(rssi_raw);
+
+    /* --- Node Specific RX Handlers --- */
+    
+    /* 1. Master Node (0x21) RX Processing */
+    if (tdma_runtime.local_node_id == TDMA_MASTER_ADDR) {
+        /* Update liveness records of sender nodes */
+        if (packet.src == TDMA_AIRCRAFT_ADDR) {
+            last_rx_frame_aircraft = tdma_runtime.frame_no;
+            
+            /* Store direct measurements */
+            master_last_measured_rssi = rssi_raw;
+            master_last_measured_lqi = lqi_raw;
+            
+            /* Increment auto-tuner reception counter */
+            tuner_rx_aircraft_packets++;
+
+            /* Parse echoed telemetry data from aircraft */
+            tdma_aircraft_data_payload_t echo_payload;
+            if (tdma_decode_aircraft_data(packet.payload, packet.payload_len, &echo_payload) == 0) {
+                char log_buf[256];
+                snprintf(log_buf, sizeof(log_buf),
+                         "%lu,ECHO_OK,%u,%d,%d,%d,%d,%.1f\r\n",
+                         (unsigned long)(get_monotonic_us() / 1000),
+                         packet.frame_no,
+                         last_rx_x_cm, last_rx_y_cm,           /* Master's calculated coordinates */
+                         echo_payload.echoed_x_cm, echo_payload.echoed_y_cm, /* Coordinates echoed back by Aircraft */
+                         rssi_dbm);
+                log_telemetry(log_buf);
+            }
+        } 
+        else if (packet.src == TDMA_ANCHOR_1_ADDR) {
+            last_rx_frame_anchor1 = tdma_runtime.frame_no;
+            
+            tdma_anchor_report_payload_t report;
+            if (tdma_decode_anchor_report(packet.payload, packet.payload_len, &report) == 0) {
+                anchor_1_reported_rssi = report.rssi_raw;
+                anchor_1_report_received = 1;
+            }
+        }
+        else if (packet.src == TDMA_ANCHOR_2_ADDR) {
+            last_rx_frame_anchor2 = tdma_runtime.frame_no;
+            
+            tdma_anchor_report_payload_t report;
+            if (tdma_decode_anchor_report(packet.payload, packet.payload_len, &report) == 0) {
+                anchor_2_reported_rssi = report.rssi_raw;
+                anchor_2_report_received = 1;
+            }
+        }
+    }
+    
+    /* 2. Anchor Nodes (0x22, 0x23) RX Processing */
+    else if (tdma_runtime.local_node_id == TDMA_ANCHOR_1_ADDR || 
+             tdma_runtime.local_node_id == TDMA_ANCHOR_2_ADDR) {
+        if (packet.type == TDMA_PKT_BEACON) {
+            /* Synchronize local clock */
+            tdma_clock_sync_beacon(&tdma_clock, packet.frame_no, (int64_t)get_monotonic_us());
+            
+            /* Extract frame period and slot width configurations */
+            tdma_beacon_payload_t beacon_payload;
+            if (tdma_decode_beacon(packet.payload, packet.payload_len, &beacon_payload) == 0) {
+                tdma_clock.frame_period_us = beacon_payload.frame_period_us;
+                tdma_clock.slot_us = beacon_payload.slot_us;
+                tdma_clock.guard_us = beacon_payload.guard_us;
+                tdma_clock.active_mask = beacon_payload.slot_table_version; /* Synchronize active_mask */
+            }
+        }
+        else if (packet.src == TDMA_AIRCRAFT_ADDR) {
+            /* Measure target signal RSSI/LQI */
+            anchor_measured_rssi = rssi_raw;
+            anchor_measured_lqi = lqi_raw;
+            anchor_has_measurement = 1;
+        }
+    }
+    
+    /* 3. Aircraft Node (0x31) RX Processing */
+    else if (tdma_runtime.local_node_id == TDMA_AIRCRAFT_ADDR) {
+        if (packet.type == TDMA_PKT_BEACON) {
+            /* Synchronize local clock */
+            tdma_clock_sync_beacon(&tdma_clock, packet.frame_no, (int64_t)get_monotonic_us());
+  
+            /* Extract feedback coordinates sent from Master beacon */
+            tdma_beacon_payload_t beacon_payload;
+            if (tdma_decode_beacon(packet.payload, packet.payload_len, &beacon_payload) == 0) {
+                last_rx_x_cm = beacon_payload.aircraft_x_cm;
+                last_rx_y_cm = beacon_payload.aircraft_y_cm;
+                
+                /* Dynamic clock parameter updates */
+                tdma_clock.frame_period_us = beacon_payload.frame_period_us;
+                tdma_clock.slot_us = beacon_payload.slot_us;
+                tdma_clock.guard_us = beacon_payload.guard_us;
+                tdma_clock.active_mask = beacon_payload.slot_table_version; /* Synchronize active_mask */
+  
+                /* Log coordinates received over telemetry link */
+                char log_buf[128];
+                snprintf(log_buf, sizeof(log_buf), "AIRCRAFT_RX_COORDS: X=%d cm, Y=%d cm\r\n", 
+                         last_rx_x_cm, last_rx_y_cm);
+                log_telemetry(log_buf);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Encodes and transmits a TDMA packet in the current TX slot.
+ */
+static void transmit_slot_packet(void)
+{
+    uint8_t tdma_payload[80];
+    uint8_t tx_buf[96];
+    tdma_packet_t packet;
+    
+    memset(&packet, 0, sizeof(packet));
+    packet.network_id = TDMA_NETWORK_ID;
+    packet.src = tdma_runtime.local_node_id;
+    packet.dst = TDMA_ADDR_BROADCAST;
+    packet.frame_no = tdma_runtime.frame_no;
+    packet.slot_no = tdma_runtime.slot_no;
+    packet.seq = (uint8_t)(tdma_runtime.frame_no & 0xff);
+    
+    size_t payload_len = 0;
+
+    /* --- Master Node Beacon Encoding --- */
+    if (tdma_runtime.local_node_id == TDMA_MASTER_ADDR) {
+        packet.type = TDMA_PKT_BEACON;
+        
+        tdma_beacon_payload_t beacon_payload;
+        beacon_payload.frame_no = tdma_runtime.frame_no;
+        beacon_payload.frame_period_us = tdma_clock.frame_period_us;
+        beacon_payload.slot_us = tdma_clock.slot_us;
+        beacon_payload.guard_us = tdma_clock.guard_us;
+        beacon_payload.slot_table_version = current_active_mask;
+        beacon_payload.aircraft_x_cm = last_rx_x_cm; /* Estimated coordinates sent to aircraft */
+        beacon_payload.aircraft_y_cm = last_rx_y_cm;
+
+        payload_len = tdma_encode_beacon(&beacon_payload, packet.payload, sizeof(packet.payload));
+    }
+    
+    /* --- Anchor Node Report Encoding --- */
+    else if (tdma_runtime.local_node_id == TDMA_ANCHOR_1_ADDR || 
+             tdma_runtime.local_node_id == TDMA_ANCHOR_2_ADDR) {
+        if (!anchor_enabled) {
+            return; /* Skip report transmission if manually disabled */
+        }
+        packet.type = TDMA_PKT_ANCHOR_REPORT;
+
+        tdma_anchor_report_payload_t report;
+        report.target_node_id = TDMA_AIRCRAFT_ADDR;
+        report.rssi_raw = anchor_measured_rssi;
+        report.lqi = anchor_measured_lqi;
+
+        payload_len = tdma_encode_anchor_report(&report, packet.payload, sizeof(packet.payload));
+        
+        /* Reset flags after sending report */
+        anchor_has_measurement = 0;
+        anchor_measured_rssi = 0;
+    }
+    
+    /* --- Aircraft Echo Telemetry Encoding --- */
+    else if (tdma_runtime.local_node_id == TDMA_AIRCRAFT_ADDR) {
+        packet.type = TDMA_PKT_DATA;
+
+        tdma_aircraft_data_payload_t aircraft_data;
+        aircraft_data.echoed_x_cm = last_rx_x_cm; /* Echo coordinate feedback back to server */
+        aircraft_data.echoed_y_cm = last_rx_y_cm;
+
+        payload_len = tdma_encode_aircraft_data(&aircraft_data, packet.payload, sizeof(packet.payload));
+    }
+
+    if (payload_len == 0) {
+        return;
+    }
+    
+    size_t tx_payload_len = tdma_encode_payload(&packet, tdma_payload, sizeof(tdma_payload));
+    if (tx_payload_len == 0) {
+        return;
+    }
+    
+    size_t tx_len = cc1101_wrap_variable_packet(0x00, tdma_payload, tx_payload_len, tx_buf, sizeof(tx_buf));
+    if (tx_len > 0) {
+        cc1101_send_packet(&radio, tx_buf, tx_len);
+    }
+}
+
+/**
+ * @brief STM32 bridge/node firmware main entry point.
+ */
+int main(void)
+{
+    /* Ensure CC1101 CSN is high initially */
+    cc1101_platform_deselect();
+    
+    /* 1. Apply CC1101 RF Presets */
+    if (cc1101_apply_rf_preset(&radio) != 0) {
+        log_telemetry("ERROR: CC1101 initialization failed\r\n");
+        while (1);
+    }
+    
+    /* 2. Initialize TDMA State */
+    tdma_clock_init(&tdma_clock);
+    
+    /* 
+     * Configure local node address dynamically or statically.
+     * Statically set to Aircraft (0x31) in this skeleton. Alter this for Master or Anchor.
+     */
+    tdma_runtime_init(&tdma_runtime, TDMA_AIRCRAFT_ADDR);
+    
+    /* 3. Initialize EKF and Master sync states */
+    if (tdma_runtime.local_node_id == TDMA_MASTER_ADDR) {
+        tdma_clock.locked = 1;
+        tdma_clock.frame_start_local_us = (int64_t)get_monotonic_us();
+        
+        /* Initialize Master's EKF tracking state */
+        ekf_init(&ekf_inst, 2.5, 2.165);
+    }
+
+    /* Turn ON user LED PA5 initially on Anchor nodes to signal active status */
+    if (tdma_runtime.local_node_id == TDMA_ANCHOR_1_ADDR || 
+        tdma_runtime.local_node_id == TDMA_ANCHOR_2_ADDR) {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+    }
+    
+    log_telemetry("INFO: TDMA runtime initialized\r\n");
+    
+    /* 4. Main runtime loop */
+    static uint16_t last_frame_no = 0xffff;
+    while (1) {
+        /* Check manual ON/OFF button PC13 on Anchor nodes */
+        if (tdma_runtime.local_node_id == TDMA_ANCHOR_1_ADDR || 
+            tdma_runtime.local_node_id == TDMA_ANCHOR_2_ADDR) {
+            uint8_t btn_state = HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13);
+            if (btn_state == 0 && last_btn_state == 1) {
+                /* Falling edge: Button pressed */
+                anchor_enabled = !anchor_enabled;
+                
+                /* Toggle LED status to reflect anchor state */
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, anchor_enabled ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                
+                if (anchor_enabled) {
+                    log_telemetry("ANCHOR: Manually ENABLED. LED ON.\r\n");
+                } else {
+                    log_telemetry("ANCHOR: Manually DISABLED. LED OFF (Silent mode).\r\n");
+                }
+                
+                /* Simple debounce delay */
+                cc1101_platform_delay_ms(100);
+            }
+            last_btn_state = btn_state;
+        }
+
+        uint64_t now = get_monotonic_us();
+        
+        /* Tick state machine to determine Slot state */
+        tdma_runtime_step_t step = tdma_runtime_tick(&tdma_runtime, &tdma_clock, (int64_t)now, current_margin_db);
+
+        /* Evaluate frame period and slot width auto-tuning on Master node */
+        if (tdma_runtime.local_node_id == TDMA_MASTER_ADDR && tdma_runtime.slot_valid) {
+            if (tdma_runtime.frame_no != last_frame_no) {
+                last_frame_no = tdma_runtime.frame_no;
+                tuner_frame_count++;
+                
+                /* 1. Liveness check to build current_active_mask */
+                uint8_t next_mask = 0x03; /* Bit 0: Master, Bit 1: Aircraft (always active) */
+                if (tdma_runtime.frame_no - last_rx_frame_anchor1 <= TDMA_ANCHOR_LOST_TIMEOUT_FRAMES) {
+                    next_mask |= (1 << 2);
+                }
+                if (tdma_runtime.frame_no - last_rx_frame_anchor2 <= TDMA_ANCHOR_LOST_TIMEOUT_FRAMES) {
+                    next_mask |= (1 << 3);
+                }
+                current_active_mask = next_mask;
+                tdma_clock.active_mask = current_active_mask; /* Update local clock active mask */
+
+                /* Count active slots */
+                uint32_t active_nodes_count = 0;
+                for (int b = 0; b < 8; b++) {
+                    if (current_active_mask & (1 << b)) {
+                        active_nodes_count++;
+                    }
+                }
+                uint32_t total_slots = active_nodes_count + 1; /* active nodes + 1 Join slot */
+                uint32_t min_limit = total_slots * tdma_clock.slot_us;
+                
+                if (tuner_state == TUNING_SWEEP && tuner_frame_count >= 100) {
+                    double pdr = (double)tuner_rx_aircraft_packets / 100.0;
+                    if (pdr >= 0.95) {
+                        /* Stable. We can shrink the frame period. */
+                        if (tdma_clock.frame_period_us > min_limit) {
+                            last_stable_frame_period = tdma_clock.frame_period_us;
+                            tdma_clock.frame_period_us -= 10000u;
+                            log_telemetry("TUNING: PDR stable, shrinking frame period\r\n");
+                        } else {
+                            /* Frame period reached min_limit. Try shrinking slot width (slot_us) */
+                            if (tdma_clock.slot_us > 5000u) { /* Minimum 5ms slot width limit */
+                                tdma_clock.slot_us -= 1000u;
+                                tdma_clock.frame_period_us = total_slots * tdma_clock.slot_us;
+                                log_telemetry("TUNING: Frame period at min limit, shrinking slot width\r\n");
+                            } else {
+                                tuner_state = TUNING_LOCKED;
+                                log_telemetry("TUNING: Reached absolute physical limits, locking settings\r\n");
+                            }
+                        }
+                    } else if (pdr < 0.90) {
+                        /* Unstable. Rollback slot width to 10ms first, then expand frame period */
+                        if (tdma_clock.slot_us < 10000u) {
+                            tdma_clock.slot_us = 10000u;
+                            tdma_clock.frame_period_us = total_slots * tdma_clock.slot_us;
+                            log_telemetry("TUNING: Unstable PDR, rollbacked slot width to 10ms\r\n");
+                        } else if (tdma_clock.frame_period_us < TDMA_FRAME_PERIOD_US) {
+                            tdma_clock.frame_period_us += 10000u;
+                            last_stable_frame_period = tdma_clock.frame_period_us;
+                            log_telemetry("TUNING: PDR dropped, expanding frame period\r\n");
+                        } else {
+                            tuner_state = TUNING_LOCKED;
+                            log_telemetry("TUNING: At maximum limit, locking period\r\n");
+                        }
+                    } else {
+                        /* Marginal zone. Lock settings */
+                        tuner_state = TUNING_LOCKED;
+                        log_telemetry("TUNING: Settled in marginal zone, locking settings\r\n");
+                    }
+                    tuner_frame_count = 0;
+                    tuner_rx_aircraft_packets = 0;
+                }
+            }
+        }
+        
+        switch (step.action) {
+        case TDMA_ACTION_SET_CHANNEL:
+            cc1101_set_channel(&radio, step.plan.channel);
+            break;
+            
+        case TDMA_ACTION_START_TX:
+            /* Apply ATPC output power level and start transmitting in assigned slots */
+            cc1101_set_tx_power(&radio, step.plan.tx_power_dbm);
+            transmit_slot_packet();
+            break;
+            
+        case TDMA_ACTION_START_RX:
+            cc1101_start_rx(&radio);
+            break;
+            
+        case TDMA_ACTION_STOP_RADIO:
+            /* Put CC1101 into idle mode during guard intervals */
+            /* cc1101_strobe(&radio, CC1101_SIDLE); */
+            break;
+            
+        case TDMA_ACTION_LOG_RX:
+            process_received_packet();
+            break;
+            
+        case TDMA_ACTION_WAIT:
+            /* If Master node, compute EKF at the transition to Slot 0 (end of frame) */
+            if (tdma_runtime.local_node_id == TDMA_MASTER_ADDR) {
+                uint8_t last_slot_in_frame = (uint8_t)(tdma_clock.frame_period_us / tdma_clock.slot_us) - 1;
+                if (step.slot_no == last_slot_in_frame && step.slot_pos_us >= (tdma_clock.slot_us - tdma_clock.guard_us)) {
+                    /* End of last slot (Guard interval). Run EKF cycle for next frame beacon */
+                    run_master_ekf_cycle();
+                }
+            }
+            break;
+            
+        case TDMA_ACTION_NONE:
+        default:
+            break;
+        }
+    }
+}

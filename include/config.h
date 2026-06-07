@@ -1,0 +1,63 @@
+#ifndef TDMA_CONFIG_H
+#define TDMA_CONFIG_H
+
+#include <stdint.h>
+
+#define TDMA_NETWORK_ID       0x16u
+#define TDMA_FRAME_PERIOD_US  100000u
+#define TDMA_SLOT_US          10000u
+#define TDMA_TXRX_US          8000u
+#define TDMA_SETTLING_US      1200u
+#define TDMA_GUARD_US         800u
+#define TDMA_MAX_NODES        16u
+#define TDMA_MAX_PAYLOAD      48u
+
+#define TDMA_ADDR_BROADCAST   0xffu
+#define TDMA_ADDR_DESKTOP     0x00u
+#define TDMA_ADDR_RASPBERRY   0x10u
+#define TDMA_ADDR_STM32_NODE  0x20u
+#define TDMA_ADDR_BASE_1      0x21u
+#define TDMA_ADDR_BASE_2      0x22u
+#define TDMA_ADDR_BASE_3      0x23u
+#define TDMA_ADDR_MOBILE_1    0x31u
+#define TDMA_ADDR_UNASSIGNED  0xfeu
+
+#define TDMA_MASTER_ADDR      TDMA_ADDR_BASE_1
+#define TDMA_ANCHOR_1_ADDR    TDMA_ADDR_BASE_2
+#define TDMA_ANCHOR_2_ADDR    TDMA_ADDR_BASE_3
+#define TDMA_AIRCRAFT_ADDR    TDMA_ADDR_MOBILE_1
+
+#define TDMA_SLOT_MASTER_BEACON   0u
+#define TDMA_SLOT_AIRCRAFT_TX     1u
+#define TDMA_SLOT_ANCHOR_1_REPORT 2u
+#define TDMA_SLOT_ANCHOR_2_REPORT 3u
+#define TDMA_SLOT_JOIN            9u
+
+#define TDMA_ANCHOR_SUSPECT_TIMEOUT_FRAMES  5u
+#define TDMA_ANCHOR_LOST_TIMEOUT_FRAMES     30u
+#define TDMA_ANCHOR_GRACE_PERIOD_FRAMES     300u
+
+#define FHSS_CHANNEL_BASE     5u
+#define FHSS_CHANNEL_COUNT    16u
+#define FHSS_LCG_A            17u
+#define FHSS_LCG_C            43u
+
+#define ATPC_MIN_TX_POWER_DBM (-10.0)
+#define ATPC_MAX_TX_POWER_DBM 10.0
+#define ATPC_TARGET_MARGIN_DB 12.0
+#define ATPC_STEP_DB          2.0
+
+#define RPI_COMM1_SPI_DEV     "/dev/spidev0.0"
+#define RPI_COMM2_SPI_DEV     "/dev/spidev0.1"
+#define RPI_COMM1_GDO0_GPIO   24
+#define RPI_COMM2_GDO0_GPIO   25
+
+#define WIN_BRIDGE_BAUD       115200u
+
+#define STM32_CC1101_SPI_HZ   6500000u
+#define CC1101_CARRIER_MHZ    433.919830
+#define CC1101_TX_POWER_DBM   5.0
+#define CC1101_RSSI_OFFSET_DB 74.0
+#define RADIO_PATH_LOSS_EXPONENT 2.0
+
+#endif

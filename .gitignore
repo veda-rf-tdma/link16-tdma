@@ -1,0 +1,5 @@
+build/
+build_new/
+*.csv
+*.log
+desktop_master_log.csv

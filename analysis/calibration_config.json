@@ -1,0 +1,35 @@
+{
+  "default_receiver_id": "0x21",
+  "anchor_node_ids": ["0x21", "0x22", "0x23"],
+  "anchor_coordinates": {
+    "0x21": [0.0, 0.0],
+    "0x22": [5.0, 0.0],
+    "0x23": [2.5, 4.33]
+  },
+  "mobile_node_ids": ["0x31"],
+  "frame_column": "frame_no",
+  "receiver_column": "receiver_id",
+  "transmitter_column": "tx_node_id",
+  "rssi_column": "rssi_dbm",
+  "timestamp_column": "timestamp",
+  "decode_ok_values": ["0"],
+  "use_only_decode_ok": true,
+  "rssi_noise_floor_dbm": -104.5,
+  "rssi_drop_threshold_db": -2.4,
+  "rssi_moving_avg_window": 5,
+  "path_loss_exponent": 2.0,
+  "apollonius_pairs": [
+    ["0x21", "0x22"],
+    ["0x21", "0x23"],
+    ["0x22", "0x23"]
+  ],
+  "apollonius_min_distance_ratio": 0.2,
+  "apollonius_max_distance_ratio": 5.0,
+  "ekf_process_noise": 0.08,
+  "ekf_measurement_noise": 1.2,
+  "baseline_dbm_by_anchor": {
+    "0x21": -45.0,
+    "0x22": -47.0,
+    "0x23": -46.0
+  }
+}
