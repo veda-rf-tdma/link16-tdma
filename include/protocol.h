@@ -28,15 +28,17 @@ typedef struct {
 } tdma_join_accept_payload_t;
 
 typedef struct {
-    uint8_t target_node_id;
-    uint8_t rssi_raw;
-    uint8_t lqi;
-} tdma_anchor_report_payload_t;
-
-typedef struct {
     int16_t echoed_x_cm;
     int16_t echoed_y_cm;
 } tdma_aircraft_data_payload_t;
+
+typedef struct {
+    uint8_t target_node_id;
+    uint8_t rssi_raw;
+    uint8_t lqi;
+    uint8_t has_relayed_data;
+    tdma_aircraft_data_payload_t relayed_data;
+} tdma_anchor_report_payload_t;
 
 typedef struct {
     uint8_t network_id;

@@ -265,6 +265,15 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
                        air_data.echoed_x_cm, air_data.echoed_y_cm);
             }
         }
+        if (pkt.type == TDMA_PKT_ANCHOR_REPORT) {
+            tdma_anchor_report_payload_t report;
+            if (tdma_decode_anchor_report(pkt.payload, pkt.payload_len, &report) == 0) {
+                if (report.has_relayed_data) {
+                    printf("[RELAY] Received aircraft coordinates relayed by Anchor 0x%02x: X=%d cm, Y=%d cm\n",
+                           pkt.src, report.relayed_data.echoed_x_cm, report.relayed_data.echoed_y_cm);
+                }
+            }
+        }
     }
 }
 

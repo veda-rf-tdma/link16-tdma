@@ -89,6 +89,13 @@ static uint8_t current_active_mask = 0x0F; /* Bit 0: Master, Bit 1: Aircraft, Bi
 static uint8_t anchor_enabled = 1; /* 1 = Enabled (ON), 0 = Disabled (OFF) */
 static uint8_t last_btn_state = 1;  /* PC13 is active-low (unpressed = 1) */
 
+/* Anchor node relay caching variables */
+static uint8_t anchor_cached_has_aircraft_data = 0;
+static tdma_aircraft_data_payload_t anchor_cached_aircraft_data;
+
+/* Master node de-duplication */
+static uint16_t master_last_processed_aircraft_frame = 0xffff;
+
 /* Local tracking variables */
 static int16_t last_rx_x_cm = 0; /* Echoed coords stored by aircraft */
 static int16_t last_rx_y_cm = 0;
@@ -261,17 +268,20 @@ static void process_received_packet(void)
             tuner_rx_aircraft_packets++;
 
             /* Parse echoed telemetry data from aircraft */
-            tdma_aircraft_data_payload_t echo_payload;
-            if (tdma_decode_aircraft_data(packet.payload, packet.payload_len, &echo_payload) == 0) {
-                char log_buf[256];
-                snprintf(log_buf, sizeof(log_buf),
-                         "%lu,ECHO_OK,%u,%d,%d,%d,%d,%.1f\r\n",
-                         (unsigned long)(get_monotonic_us() / 1000),
-                         packet.frame_no,
-                         last_rx_x_cm, last_rx_y_cm,           /* Master's calculated coordinates */
-                         echo_payload.echoed_x_cm, echo_payload.echoed_y_cm, /* Coordinates echoed back by Aircraft */
-                         rssi_dbm);
-                log_telemetry(log_buf);
+            if (packet.frame_no != master_last_processed_aircraft_frame) {
+                master_last_processed_aircraft_frame = packet.frame_no;
+                tdma_aircraft_data_payload_t echo_payload;
+                if (tdma_decode_aircraft_data(packet.payload, packet.payload_len, &echo_payload) == 0) {
+                    char log_buf[256];
+                    snprintf(log_buf, sizeof(log_buf),
+                             "%lu,ECHO_OK,%u,%d,%d,%d,%d,%.1f\r\n",
+                             (unsigned long)(get_monotonic_us() / 1000),
+                             packet.frame_no,
+                             last_rx_x_cm, last_rx_y_cm,           /* Master's calculated coordinates */
+                             echo_payload.echoed_x_cm, echo_payload.echoed_y_cm, /* Coordinates echoed back by Aircraft */
+                             rssi_dbm);
+                    log_telemetry(log_buf);
+                }
             }
         } 
         else if (packet.src == TDMA_ANCHOR_1_ADDR) {
@@ -281,6 +291,20 @@ static void process_received_packet(void)
             if (tdma_decode_anchor_report(packet.payload, packet.payload_len, &report) == 0) {
                 anchor_1_reported_rssi = report.rssi_raw;
                 anchor_1_report_received = 1;
+                
+                /* Process relayed telemetry if direct receipt was missed */
+                if (report.has_relayed_data && packet.frame_no != master_last_processed_aircraft_frame) {
+                    master_last_processed_aircraft_frame = packet.frame_no;
+                    char log_buf[256];
+                    snprintf(log_buf, sizeof(log_buf),
+                             "%lu,RELAY_OK,%u,%d,%d,%d,%d,%.1f,via_0x%02x\r\n",
+                             (unsigned long)(get_monotonic_us() / 1000),
+                             packet.frame_no,
+                             last_rx_x_cm, last_rx_y_cm,
+                             report.relayed_data.echoed_x_cm, report.relayed_data.echoed_y_cm,
+                             rssi_dbm, packet.src);
+                    log_telemetry(log_buf);
+                }
             }
         }
         else if (packet.src == TDMA_ANCHOR_2_ADDR) {
@@ -290,6 +314,20 @@ static void process_received_packet(void)
             if (tdma_decode_anchor_report(packet.payload, packet.payload_len, &report) == 0) {
                 anchor_2_reported_rssi = report.rssi_raw;
                 anchor_2_report_received = 1;
+                
+                /* Process relayed telemetry if direct receipt was missed */
+                if (report.has_relayed_data && packet.frame_no != master_last_processed_aircraft_frame) {
+                    master_last_processed_aircraft_frame = packet.frame_no;
+                    char log_buf[256];
+                    snprintf(log_buf, sizeof(log_buf),
+                             "%lu,RELAY_OK,%u,%d,%d,%d,%d,%.1f,via_0x%02x\r\n",
+                             (unsigned long)(get_monotonic_us() / 1000),
+                             packet.frame_no,
+                             last_rx_x_cm, last_rx_y_cm,
+                             report.relayed_data.echoed_x_cm, report.relayed_data.echoed_y_cm,
+                             rssi_dbm, packet.src);
+                    log_telemetry(log_buf);
+                }
             }
         }
     }
@@ -315,6 +353,11 @@ static void process_received_packet(void)
             anchor_measured_rssi = rssi_raw;
             anchor_measured_lqi = lqi_raw;
             anchor_has_measurement = 1;
+            
+            /* Decode and cache aircraft data for relaying */
+            if (tdma_decode_aircraft_data(packet.payload, packet.payload_len, &anchor_cached_aircraft_data) == 0) {
+                anchor_cached_has_aircraft_data = 1;
+            }
         }
     }
     
@@ -393,12 +436,16 @@ static void transmit_slot_packet(void)
         report.target_node_id = TDMA_AIRCRAFT_ADDR;
         report.rssi_raw = anchor_measured_rssi;
         report.lqi = anchor_measured_lqi;
+        report.has_relayed_data = anchor_cached_has_aircraft_data;
+        report.relayed_data = anchor_cached_aircraft_data;
 
         payload_len = tdma_encode_anchor_report(&report, packet.payload, sizeof(packet.payload));
         
-        /* Reset flags after sending report */
+        /* Reset flags and cache after sending report */
         anchor_has_measurement = 0;
         anchor_measured_rssi = 0;
+        anchor_cached_has_aircraft_data = 0;
+        memset(&anchor_cached_aircraft_data, 0, sizeof(anchor_cached_aircraft_data));
     }
     
     /* --- Aircraft Echo Telemetry Encoding --- */

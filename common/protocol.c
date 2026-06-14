@@ -155,19 +155,27 @@ int tdma_decode_join_accept(const uint8_t *data, size_t len, tdma_join_accept_pa
 
 size_t tdma_encode_anchor_report(const tdma_anchor_report_payload_t *payload, uint8_t *out, size_t out_len)
 {
-    if (!payload || !out || out_len < 3) return 0;
+    if (!payload || !out || out_len < 8) return 0;
     out[0] = payload->target_node_id;
     out[1] = payload->rssi_raw;
     out[2] = payload->lqi;
-    return 3;
+    out[3] = payload->has_relayed_data;
+    out[4] = (uint8_t)(payload->relayed_data.echoed_x_cm >> 8);
+    out[5] = (uint8_t)(payload->relayed_data.echoed_x_cm & 0xff);
+    out[6] = (uint8_t)(payload->relayed_data.echoed_y_cm >> 8);
+    out[7] = (uint8_t)(payload->relayed_data.echoed_y_cm & 0xff);
+    return 8;
 }
 
 int tdma_decode_anchor_report(const uint8_t *data, size_t len, tdma_anchor_report_payload_t *payload)
 {
-    if (!data || !payload || len < 3) return -1;
+    if (!data || !payload || len < 8) return -1;
     payload->target_node_id = data[0];
     payload->rssi_raw = data[1];
     payload->lqi = data[2];
+    payload->has_relayed_data = data[3];
+    payload->relayed_data.echoed_x_cm = (int16_t)(((int16_t)data[4] << 8) | data[5]);
+    payload->relayed_data.echoed_y_cm = (int16_t)(((int16_t)data[6] << 8) | data[7]);
     return 0;
 }
 
