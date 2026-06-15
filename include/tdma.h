@@ -20,7 +20,6 @@ typedef enum {
     TDMA_NODE_AIRCRAFT,
     TDMA_NODE_ANCHOR_1,
     TDMA_NODE_ANCHOR_2,
-    TDMA_NODE_GATEWAY,
     TDMA_NODE_DESKTOP,
     TDMA_NODE_UNASSIGNED
 } tdma_node_role_t;

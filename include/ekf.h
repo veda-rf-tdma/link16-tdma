@@ -24,5 +24,6 @@ typedef struct {
 void ekf_init(ekf_t *ekf, double px0, double py0);
 void ekf_predict(ekf_t *ekf, double dt);
 int ekf_update_apollonius(ekf_t *ekf, const char *anchor_a_id, const char *anchor_b_id, double z_ratio);
+void ekf_set_anchor_position(ekf_t *ekf, const char *id, double x, double y);
 
 #endif

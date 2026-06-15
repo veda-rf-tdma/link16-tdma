@@ -51,6 +51,12 @@ static inline void HAL_GPIO_WritePin(void* port, uint16_t pin, GPIO_PinState sta
 }
 #endif
 
+#ifndef HAL_GPIO_TogglePin
+static inline void HAL_GPIO_TogglePin(void* port, uint16_t pin) {
+    (void)port; (void)pin;
+}
+#endif
+
 /* Standard CubeMX device structures (placeholders) */
 typedef struct {
     int dummy;
@@ -112,6 +118,7 @@ static int anchor_2_report_received = 0;
 static uint8_t anchor_measured_rssi = 0;
 static uint8_t anchor_measured_lqi = 0;
 static int anchor_has_measurement = 0;
+static double current_margin_db = ATPC_TARGET_MARGIN_DB;
 
 /* Low-level platform dependencies required by cc1101_stm32.h */
 void cc1101_platform_select(void)
@@ -292,10 +299,17 @@ static void process_received_packet(void)
                 anchor_1_reported_rssi = report.rssi_raw;
                 anchor_1_report_received = 1;
                 
+                char log_buf[256];
+                snprintf(log_buf, sizeof(log_buf),
+                         "%lu,REPORT_RX,%u,0x%02x,0x%02x,%.1f,0x%02x\r\n",
+                         (unsigned long)(get_monotonic_us() / 1000),
+                         packet.frame_no, packet.src, report.target_node_id,
+                         cc1101_rssi_dbm(report.rssi_raw), report.lqi);
+                log_telemetry(log_buf);
+
                 /* Process relayed telemetry if direct receipt was missed */
                 if (report.has_relayed_data && packet.frame_no != master_last_processed_aircraft_frame) {
                     master_last_processed_aircraft_frame = packet.frame_no;
-                    char log_buf[256];
                     snprintf(log_buf, sizeof(log_buf),
                              "%lu,RELAY_OK,%u,%d,%d,%d,%d,%.1f,via_0x%02x\r\n",
                              (unsigned long)(get_monotonic_us() / 1000),
@@ -315,10 +329,17 @@ static void process_received_packet(void)
                 anchor_2_reported_rssi = report.rssi_raw;
                 anchor_2_report_received = 1;
                 
+                char log_buf[256];
+                snprintf(log_buf, sizeof(log_buf),
+                         "%lu,REPORT_RX,%u,0x%02x,0x%02x,%.1f,0x%02x\r\n",
+                         (unsigned long)(get_monotonic_us() / 1000),
+                         packet.frame_no, packet.src, report.target_node_id,
+                         cc1101_rssi_dbm(report.rssi_raw), report.lqi);
+                log_telemetry(log_buf);
+
                 /* Process relayed telemetry if direct receipt was missed */
                 if (report.has_relayed_data && packet.frame_no != master_last_processed_aircraft_frame) {
                     master_last_processed_aircraft_frame = packet.frame_no;
-                    char log_buf[256];
                     snprintf(log_buf, sizeof(log_buf),
                              "%lu,RELAY_OK,%u,%d,%d,%d,%d,%.1f,via_0x%02x\r\n",
                              (unsigned long)(get_monotonic_us() / 1000),
@@ -346,6 +367,15 @@ static void process_received_packet(void)
                 tdma_clock.slot_us = beacon_payload.slot_us;
                 tdma_clock.guard_us = beacon_payload.guard_us;
                 tdma_clock.active_mask = beacon_payload.slot_table_version; /* Synchronize active_mask */
+                
+                /* LED Test Override Handler */
+                static uint8_t last_led_cmd = 0;
+                uint8_t current_led_cmd = (beacon_payload.slot_table_version & 0x80) ? 1 : 0;
+                if (current_led_cmd != last_led_cmd) {
+                    last_led_cmd = current_led_cmd;
+                    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+                    log_telemetry("LED: Master command triggered LED Toggle.\r\n");
+                }
             }
         }
         else if (packet.src == TDMA_AIRCRAFT_ADDR) {
@@ -379,6 +409,15 @@ static void process_received_packet(void)
                 tdma_clock.guard_us = beacon_payload.guard_us;
                 tdma_clock.active_mask = beacon_payload.slot_table_version; /* Synchronize active_mask */
   
+                /* LED Test Override Handler */
+                static uint8_t last_led_cmd = 0;
+                uint8_t current_led_cmd = (beacon_payload.slot_table_version & 0x80) ? 1 : 0;
+                if (current_led_cmd != last_led_cmd) {
+                    last_led_cmd = current_led_cmd;
+                    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+                    log_telemetry("LED: Master command triggered LED Toggle.\r\n");
+                }
+  
                 /* Log coordinates received over telemetry link */
                 char log_buf[128];
                 snprintf(log_buf, sizeof(log_buf), "AIRCRAFT_RX_COORDS: X=%d cm, Y=%d cm\r\n", 
@@ -404,7 +443,6 @@ static void transmit_slot_packet(void)
     packet.dst = TDMA_ADDR_BROADCAST;
     packet.frame_no = tdma_runtime.frame_no;
     packet.slot_no = tdma_runtime.slot_no;
-    packet.seq = (uint8_t)(tdma_runtime.frame_no & 0xff);
     
     size_t payload_len = 0;
 

@@ -2,10 +2,12 @@
 #include <string.h>
 #include <math.h>
 
-#ifndef _WIN32
-#include <strings.h> /* for strcasecmp on POSIX systems */
-#else
+#if defined(_WIN32)
 #define strcasecmp _stricmp
+#elif defined(__arm__)
+#define strcasecmp strcmp
+#else
+#include <strings.h> /* for strcasecmp on POSIX systems */
 #endif
 
 void ekf_init(ekf_t *ekf, double px0, double py0)
@@ -154,4 +156,23 @@ int ekf_update_apollonius(ekf_t *ekf, const char *anchor_a_id, const char *ancho
     memcpy(ekf->P, P_new, sizeof(ekf->P));
 
     return 0;
+}
+
+void ekf_set_anchor_position(ekf_t *ekf, const char *id, double x, double y)
+{
+    for (int i = 0; i < ekf->anchor_count; i++) {
+        if (strcasecmp(ekf->anchors[i].id, id) == 0) {
+            ekf->anchors[i].x = x;
+            ekf->anchors[i].y = y;
+            return;
+        }
+    }
+    /* Add new anchor if it doesn't exist and there is space */
+    if (ekf->anchor_count < EKF_MAX_ANCHORS) {
+        strncpy(ekf->anchors[ekf->anchor_count].id, id, sizeof(ekf->anchors[ekf->anchor_count].id) - 1);
+        ekf->anchors[ekf->anchor_count].id[sizeof(ekf->anchors[ekf->anchor_count].id) - 1] = '\0';
+        ekf->anchors[ekf->anchor_count].x = x;
+        ekf->anchors[ekf->anchor_count].y = y;
+        ekf->anchor_count++;
+    }
 }

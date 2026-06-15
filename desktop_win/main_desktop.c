@@ -2,8 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <conio.h>
 #endif
 #include "config.h"
 #include "protocol.h"
@@ -11,6 +13,50 @@
 #include "stm32_bridge_link.h"
 #include "tdma.h"
 #include "node_table.h"
+#include "ekf.h"
+
+/* Keypress stubs and mapping for cross-platform fallback */
+static int check_keypress(void)
+{
+#ifdef _WIN32
+    return _kbhit();
+#else
+    return 0;
+#endif
+}
+
+static int get_keypress(void)
+{
+#ifdef _WIN32
+    return _getch();
+#else
+    return 0;
+#endif
+}
+
+typedef enum {
+    MODE_LIVENESS_MONITOR,
+    MODE_ACTIVE_TRACKING
+} desktop_mode_t;
+
+static desktop_mode_t current_desktop_mode = MODE_LIVENESS_MONITOR;
+static ekf_t desktop_ekf;
+static int desktop_ekf_initialized = 0;
+
+/* EKF intermediate RSSI caches */
+static uint8_t desktop_master_last_rssi = 0;
+static uint8_t desktop_anchor1_last_rssi = 0;
+static uint8_t desktop_anchor2_last_rssi = 0;
+static int desktop_master_has_rssi = 0;
+static int desktop_anchor1_has_rssi = 0;
+static int desktop_anchor2_has_rssi = 0;
+
+static int16_t desktop_est_x_cm = 0;
+static int16_t desktop_est_y_cm = 0;
+
+/* Interactive LED toggle variables */
+static int desktop_led_command_active = 0;
+static int desktop_led_command_frame_counter = 0;
 
 /* Desktop master dynamic frame period auto-tuning variables */
 static uint32_t desktop_frame_period_us = TDMA_FRAME_PERIOD_US;
@@ -75,9 +121,18 @@ static size_t build_beacon(uint16_t frame_no, uint8_t *out, size_t out_len)
     payload.frame_period_us = desktop_frame_period_us;
     payload.slot_us = desktop_slot_us;
     payload.guard_us = TDMA_GUARD_US;
-    payload.slot_table_version = desktop_active_mask;
-    payload.aircraft_x_cm = 0; /* Default 0 on desktop */
-    payload.aircraft_y_cm = 0;
+    
+    uint8_t final_mask = desktop_active_mask;
+    if (desktop_led_command_active) {
+        final_mask |= 0x80;
+        desktop_led_command_frame_counter--;
+        if (desktop_led_command_frame_counter <= 0) {
+            desktop_led_command_active = 0;
+        }
+    }
+    payload.slot_table_version = final_mask;
+    payload.aircraft_x_cm = desktop_est_x_cm;
+    payload.aircraft_y_cm = desktop_est_y_cm;
 
     pkt.payload_len = (uint8_t)tdma_encode_beacon(&payload, pkt.payload, sizeof(pkt.payload));
     return tdma_encode_payload(&pkt, out, out_len);
@@ -264,6 +319,24 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
                 printf("[ECHO] Received coordinate feedback from aircraft: X=%d cm, Y=%d cm\n",
                        air_data.echoed_x_cm, air_data.echoed_y_cm);
             }
+            /* Cache direct measurement from aircraft */
+            desktop_master_last_rssi = rssi;
+            desktop_master_has_rssi = 1;
+        } else if (pkt.type == TDMA_PKT_ANCHOR_REPORT) {
+            tdma_anchor_report_payload_t report;
+            if (tdma_decode_anchor_report(pkt.payload, pkt.payload_len, &report) == 0) {
+                if (pkt.src == TDMA_ANCHOR_1_ADDR) {
+                    desktop_anchor1_last_rssi = report.rssi_raw;
+                    desktop_anchor1_has_rssi = 1;
+                } else if (pkt.src == TDMA_ANCHOR_2_ADDR) {
+                    desktop_anchor2_last_rssi = report.rssi_raw;
+                    desktop_anchor2_has_rssi = 1;
+                }
+                if (report.has_relayed_data) {
+                    printf("[RELAY] Received aircraft coordinates relayed by Anchor 0x%02x: X=%d cm, Y=%d cm\n",
+                           pkt.src, report.relayed_data.echoed_x_cm, report.relayed_data.echoed_y_cm);
+                }
+            }
         }
         if (pkt.type == TDMA_PKT_ANCHOR_REPORT) {
             tdma_anchor_report_payload_t report;
@@ -275,6 +348,188 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
             }
         }
     }
+}
+
+#define MAX_PROFILES 32
+typedef struct {
+    char name[64];
+    double x1, y1, x2, y2;
+} anchor_profile_t;
+
+static void save_anchor_profile(const char *name, double x1, double y1, double x2, double y2)
+{
+    anchor_profile_t profiles[MAX_PROFILES];
+    int count = 0;
+
+    FILE *f = fopen("anchor_profiles.txt", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f) && count < MAX_PROFILES) {
+            char p_name[64];
+            double px1, py1, px2, py2;
+            if (sscanf(line, "%63[^,],%lf,%lf,%lf,%lf", p_name, &px1, &py1, &px2, &py2) == 5) {
+                strcpy(profiles[count].name, p_name);
+                profiles[count].x1 = px1;
+                profiles[count].y1 = py1;
+                profiles[count].x2 = px2;
+                profiles[count].y2 = py2;
+                count++;
+            }
+        }
+        fclose(f);
+    }
+
+    int found_target = -1;
+    int found_latest = -1;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(profiles[i].name, name) == 0) found_target = i;
+        if (strcmp(profiles[i].name, "__latest__") == 0) found_latest = i;
+    }
+
+    if (found_target != -1) {
+        profiles[found_target].x1 = x1;
+        profiles[found_target].y1 = y1;
+        profiles[found_target].x2 = x2;
+        profiles[found_target].y2 = y2;
+    } else if (count < MAX_PROFILES) {
+        strcpy(profiles[count].name, name);
+        profiles[count].x1 = x1;
+        profiles[count].y1 = y1;
+        profiles[count].x2 = x2;
+        profiles[count].y2 = y2;
+        count++;
+    }
+
+    if (found_latest != -1) {
+        profiles[found_latest].x1 = x1;
+        profiles[found_latest].y1 = y1;
+        profiles[found_latest].x2 = x2;
+        profiles[found_latest].y2 = y2;
+    } else if (count < MAX_PROFILES) {
+        strcpy(profiles[count].name, "__latest__");
+        profiles[count].x1 = x1;
+        profiles[count].y1 = y1;
+        profiles[count].x2 = x2;
+        profiles[count].y2 = y2;
+        count++;
+    }
+
+    f = fopen("anchor_profiles.txt", "w");
+    if (f) {
+        for (int i = 0; i < count; i++) {
+            fprintf(f, "%s,%.3f,%.3f,%.3f,%.3f\n", 
+                    profiles[i].name, 
+                    profiles[i].x1, profiles[i].y1, 
+                    profiles[i].x2, profiles[i].y2);
+        }
+        fclose(f);
+    }
+}
+
+static int load_anchor_profile(const char *name, double *x1, double *y1, double *x2, double *y2)
+{
+    FILE *f = fopen("anchor_profiles.txt", "r");
+    if (!f) return 0;
+
+    char line[256];
+    int found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char p_name[64];
+        double px1, py1, px2, py2;
+        if (sscanf(line, "%63[^,],%lf,%lf,%lf,%lf", p_name, &px1, &py1, &px2, &py2) == 5) {
+            if (strcmp(p_name, name) == 0) {
+                *x1 = px1;
+                *y1 = py1;
+                *x2 = px2;
+                *y2 = py2;
+                found = 1;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void print_available_profiles(void)
+{
+    FILE *f = fopen("anchor_profiles.txt", "r");
+    if (!f) {
+        printf("  No saved profiles found.\n");
+        return;
+    }
+
+    char line[256];
+    int count = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char p_name[64];
+        double px1, py1, px2, py2;
+        if (sscanf(line, "%63[^,],%lf,%lf,%lf,%lf", p_name, &px1, &py1, &px2, &py2) == 5) {
+            if (strcmp(p_name, "__latest__") != 0) {
+                printf("  - %s: Anchor1=(%.2f, %.2f) m, Anchor2=(%.2f, %.2f) m\n", 
+                       p_name, px1, py1, px2, py2);
+                count++;
+            }
+        }
+    }
+    fclose(f);
+    if (count == 0) {
+        printf("  No custom profiles registered yet.\n");
+    }
+}
+
+static void run_desktop_ekf_cycle(uint16_t frame_no, FILE *log)
+{
+    if (!desktop_ekf_initialized || current_desktop_mode != MODE_ACTIVE_TRACKING) {
+        return;
+    }
+
+    double dt = (double)desktop_frame_period_us / 1000000.0;
+    ekf_predict(&desktop_ekf, dt);
+
+    double alpha = 2.0;
+    double p_m = 0.0, p_a1 = 0.0, p_a2 = 0.0;
+    int has_m = desktop_master_has_rssi;
+    int has_a1 = desktop_anchor1_has_rssi;
+    int has_a2 = desktop_anchor2_has_rssi;
+
+    if (has_m) p_m = pow(10.0, cc1101_rssi_dbm(desktop_master_last_rssi) / 10.0);
+    if (has_a1) p_a1 = pow(10.0, cc1101_rssi_dbm(desktop_anchor1_last_rssi) / 10.0);
+    if (has_a2) p_a2 = pow(10.0, cc1101_rssi_dbm(desktop_anchor2_last_rssi) / 10.0);
+
+    /* EKF sequential update for available pairs */
+    if (has_m && has_a1 && p_m > 0 && p_a1 > 0) {
+        double z_12 = pow(p_a1 / p_m, 1.0 / alpha);
+        ekf_update_apollonius(&desktop_ekf, "0x21", "0x22", z_12);
+    }
+    if (has_m && has_a2 && p_m > 0 && p_a2 > 0) {
+        double z_13 = pow(p_a2 / p_m, 1.0 / alpha);
+        ekf_update_apollonius(&desktop_ekf, "0x21", "0x23", z_13);
+    }
+    if (has_a1 && has_a2 && p_a1 > 0 && p_a2 > 0) {
+        double z_23 = pow(p_a2 / p_a1, 1.0 / alpha);
+        ekf_update_apollonius(&desktop_ekf, "0x22", "0x23", z_23);
+    }
+
+    desktop_est_x_cm = (int16_t)(desktop_ekf.state[0] * 100.0);
+    desktop_est_y_cm = (int16_t)(desktop_ekf.state[1] * 100.0);
+
+    double uncertainty = sqrt(desktop_ekf.P[0][0] + desktop_ekf.P[1][1]);
+    printf("[EKF] Frame %u: Est Target Position=(%.2f, %.2f) m, Uncertainty=%.3f\n",
+           frame_no, desktop_ekf.state[0], desktop_ekf.state[1], uncertainty);
+
+    if (log) {
+        char ts[32];
+        format_timestamp(ts, sizeof(ts));
+        fprintf(log, "%s,EKF_EST,%u,0x%02x,MASTER,0x31,AIRCRAFT,0,UNUSED,0,0,0,0,Est=(%.4f;%.4f) Uncertainty=%.4f\n",
+                ts, frame_no, TDMA_MASTER_ADDR, desktop_ekf.state[0], desktop_ekf.state[1], uncertainty);
+        fflush(log);
+    }
+
+    /* Reset flags for next frame */
+    desktop_master_has_rssi = 0;
+    desktop_anchor1_has_rssi = 0;
+    desktop_anchor2_has_rssi = 0;
 }
 
 /**
@@ -325,6 +580,11 @@ int main(int argc, char **argv)
     }
 
     printf("desktop master started: port=%s frames=%lu log=%s\n", port, frame_count, log_path);
+    printf("=========================================================================\n");
+    printf("[MODE] Liveness Monitoring Phase. Active nodes will print below.\n");
+    printf("Press 's' to configure coordinates and start real-time EKF positioning.\n");
+    printf("=========================================================================\n\n");
+
     for (unsigned long i = 0; i < frame_count; i++) {
         uint16_t frame_no = (uint16_t)i;
         
@@ -342,6 +602,121 @@ int main(int argc, char **argv)
             next_mask |= (1 << 3);
         }
         desktop_active_mask = next_mask;
+
+        /* Print liveness periodically in MONITOR mode */
+        if (current_desktop_mode == MODE_LIVENESS_MONITOR && i % 10 == 0) {
+            printf("[LIVENESS] Frame %u - Active Nodes: Master(0x21): OK, Aircraft(0x31): OK, Anchor1(0x22): %s, Anchor2(0x23): %s\n",
+                   frame_no, 
+                   (desktop_active_mask & (1 << 2)) ? "ACTIVE" : "LOST/OFFLINE",
+                   (desktop_active_mask & (1 << 3)) ? "ACTIVE" : "LOST/OFFLINE");
+        }
+
+        /* Check for keyboard trigger */
+        if (check_keypress()) {
+            int key = get_keypress();
+            if (key == 't' || key == 'T') {
+                desktop_led_command_active = 1;
+                desktop_led_command_frame_counter = 5;
+                printf("\n[LED] Toggle command injected (will transmit for 5 frames)!\n");
+            }
+            else if (current_desktop_mode == MODE_LIVENESS_MONITOR && (key == 's' || key == 'S')) {
+                printf("\n=========================================================\n");
+                printf("[SETUP] Keyboard trigger detected. Setting up Anchor coordinates.\n");
+                printf("=========================================================\n");
+                printf("Select Setup Method:\n");
+                printf("  1. Enter new coordinates and save profile\n");
+                printf("  2. Load last used coordinates (__latest__)\n");
+                printf("  3. Load coordinates by profile name\n");
+                printf("Option (1-3): ");
+                fflush(stdout);
+
+                int opt = 0;
+                if (scanf("%d", &opt) != 1) {
+                    while (getchar() != '\n');
+                    opt = 1; // default to enter new
+                }
+                int c;
+                while ((c = getchar()) != '\n' && c != EOF);
+
+                double x1 = 5.0, y1 = 0.0;
+                double x2 = 2.5, y2 = 4.33;
+                int setup_ok = 0;
+
+                if (opt == 1) {
+                    printf("\nEnter relative X Y coords for Anchor 1 (0x22) in meters (default 5.0 0.0): ");
+                    fflush(stdout);
+                    if (scanf("%lf %lf", &x1, &y1) != 2) {
+                        while (getchar() != '\n');
+                    }
+                    printf("Enter relative X Y coords for Anchor 2 (0x23) in meters (default 2.5 4.33): ");
+                    fflush(stdout);
+                    if (scanf("%lf %lf", &x2, &y2) != 2) {
+                        while (getchar() != '\n');
+                    }
+                    while ((c = getchar()) != '\n' && c != EOF);
+
+                    char p_name[64];
+                    printf("Enter profile name to save this configuration (e.g. lab_room_1): ");
+                    fflush(stdout);
+                    if (scanf("%63s", p_name) == 1) {
+                        save_anchor_profile(p_name, x1, y1, x2, y2);
+                        printf("[SUCCESS] Profile '%s' saved and set to __latest__.\n", p_name);
+                    } else {
+                        save_anchor_profile("default", x1, y1, x2, y2);
+                        printf("[SUCCESS] Saved as profile 'default' and set to __latest__.\n");
+                    }
+                    while ((c = getchar()) != '\n' && c != EOF);
+                    setup_ok = 1;
+                }
+                else if (opt == 2) {
+                    if (load_anchor_profile("__latest__", &x1, &y1, &x2, &y2)) {
+                        printf("\n[SUCCESS] Loaded last used coordinates (__latest__):\n");
+                        printf("  Anchor 1 (0x22): (%.2f, %.2f) m\n", x1, y1);
+                        printf("  Anchor 2 (0x23): (%.2f, %.2f) m\n", x2, y2);
+                        setup_ok = 1;
+                    } else {
+                        printf("\n[ERROR] No last used coordinates (__latest__) found. Please enter manually.\n");
+                        setup_ok = 0;
+                    }
+                }
+                else if (opt == 3) {
+                    printf("\n--- Available Profiles ---\n");
+                    print_available_profiles();
+                    printf("--------------------------\n");
+                    char p_name[64];
+                    printf("Enter profile name to load: ");
+                    fflush(stdout);
+                    if (scanf("%63s", p_name) == 1) {
+                        if (load_anchor_profile(p_name, &x1, &y1, &x2, &y2)) {
+                            printf("[SUCCESS] Loaded profile '%s':\n", p_name);
+                            printf("  Anchor 1 (0x22): (%.2f, %.2f) m\n", x1, y1);
+                            printf("  Anchor 2 (0x23): (%.2f, %.2f) m\n", x2, y2);
+                            
+                            save_anchor_profile("__latest__", x1, y1, x2, y2);
+                            setup_ok = 1;
+                        } else {
+                            printf("[ERROR] Profile '%s' not found.\n", p_name);
+                            setup_ok = 0;
+                        }
+                    }
+                    while ((c = getchar()) != '\n' && c != EOF);
+                }
+
+                if (setup_ok) {
+                    /* Initialize EKF with loaded/input coordinates */
+                    ekf_init(&desktop_ekf, x1 / 2.0, y2 / 2.0);
+                    ekf_set_anchor_position(&desktop_ekf, "0x21", 0.0, 0.0);
+                    ekf_set_anchor_position(&desktop_ekf, "0x22", x1, y1);
+                    ekf_set_anchor_position(&desktop_ekf, "0x23", x2, y2);
+                    desktop_ekf_initialized = 1;
+                    current_desktop_mode = MODE_ACTIVE_TRACKING;
+
+                    printf("\n=========================================================\n");
+                    printf("[TRACKING] Real-time EKF positioning activated.\n");
+                    printf("=========================================================\n\n");
+                }
+            }
+        }
 
         /* Calculate total slots and min_limit */
         uint32_t active_nodes_count = 0;
@@ -406,6 +781,11 @@ int main(int argc, char **argv)
         for (int poll = 0; poll < 10; poll++) {
             poll_and_log_rx(&bridge, log, frame_no, &master_node_table);
             sleep_ms(poll_sleep);
+        }
+
+        /* Run EKF cycle at the end of the frame */
+        if (current_desktop_mode == MODE_ACTIVE_TRACKING) {
+            run_desktop_ekf_cycle(frame_no, log);
         }
     }
 

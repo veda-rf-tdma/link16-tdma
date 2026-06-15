@@ -1,6 +1,6 @@
 # STM32 Bridge Setup
 
-이 문서는 `Desktop master -> STM32 USB CDC bridge -> CC1101 -> Raspberry gateway` 테스트를 위해 STM32CubeIDE 프로젝트에 어떤 설정과 코드를 넣어야 하는지 정리한다.
+이 문서는 `Desktop master -> STM32 USB CDC bridge -> CC1101 -> STM32 gateway` 테스트를 위해 STM32CubeIDE 프로젝트에 어떤 설정과 코드를 넣어야 하는지 정리한다.
 
 ## Target Role
 
@@ -33,41 +33,75 @@ STM32는 PC와 CC1101 사이의 브리지다.
 - `PA5`는 SPI1_SCK로 써야 하며 LED GPIO로 쓰면 안 된다.
 - `CSN`은 SPI hardware NSS가 아니라 GPIO output으로 직접 제어한다.
 
-## CubeMX Settings
+## CubeMX Settings (Pinout & Configuration 상세 설정)
 
-### SYS
+CubeMX의 **Pinout & Configuration** 탭 및 **Clock Configuration**, **Project Manager**에서 아래와 같이 설정합니다.
 
-- Debug: Serial Wire
+### 1. Pinout & Configuration 설정
 
-	### Clock
-	
-	- 기본 HSI/PLL 설정으로 시작 가능
-	- USB CDC 사용 시 USB clock이 48 MHz 조건을 만족해야 한다.
+#### **System Core -> SYS**
+- **Debug**: `Serial Wire` (ST-Link 디버깅 및 펌웨어 업로드를 위해 필수)
+- **Timebase Source**: `SysTick` (기본값)
 
-### SPI1
+#### **System Core -> NVIC**
+- **EXTI line0 interrupt** (`PB0` EXTI 활성화 시): **Enabled** 체크 (CC1101의 수신 완료 인터럽트 처리에 필요)
+- **USB On The Go FS global interrupt** (USB 사용 시): **Enabled** 체크
 
-- Mode: Full-Duplex Master
-- Data Size: 8 Bits
-- First Bit: MSB First
-- Clock Polarity: Low
-- Clock Phase: 1 Edge
-- NSS: Software
-- Prescaler: bring-up은 1 MHz 근처에서 시작하고, 안정화 후 현재 목표 설정인 6.5 MHz로 올린다.
+#### **System Core -> GPIO**
+- **PA4**: `GPIO_Output`으로 설정
+  - **GPIO output level**: `High` (CC1101 CSN은 Idle 상태에서 High여야 함)
+  - **GPIO mode**: `Output Push Pull`
+  - **GPIO Pull-up/Pull-down**: `No pull-up and no pull-down`
+  - **Maximum output speed**: `Medium` 또는 `High`
+  - **User Label**: `CC1101_CSN`
+- **PB0** (또는 GDO0 연결 핀): `GPIO_EXTI0`으로 설정
+  - **GPIO mode**: `External Interrupt Mode with Rising/Falling edge trigger detection` (CC1101 GDO0의 신호 변화 감지)
+  - **GPIO Pull-up/Pull-down**: `No pull-up and no pull-down` 또는 `Pull-down` (회로에 따라 설정)
+  - **User Label**: `CC1101_GDO0`
+- **PA8** (상태 표시용 LED, 필요한 경우): `GPIO_Output`
+  - PA5는 SPI1_SCK와 겹쳐 온보드 LED(LD2)를 쓸 수 없으므로, 외부 LED를 제어하기 위해 설정
 
-CC1101은 SPI mode 0 기준이다.
+#### **Connectivity -> SPI1**
+- **Mode**: `Full-Duplex Master`
+- **Hardware NSS Signal**: `Disable` (PA4 GPIO로 직접 제어함)
+- **Basic Parameters**:
+  - **Frame Format**: `Motorola`
+  - **Data Size**: `8 Bits`
+  - **First Bit**: `MSB First`
+- **Clock Parameters**:
+  - **Prescaler (Divisor)**: 초기 디버깅 시에는 `1 MHz` 근처 속도(예: 64 분주 등)로 설정하여 안정성을 확인한 후, 최종 속도인 **6.5 MHz** 근처로 설정(예: 84MHz 클럭 기준 16 분주 시 5.25MHz, 8 분주 시 10.5MHz이므로 보드 클럭과 분주비를 맞추어 6.5MHz 이하로 설정).
+  - **Clock Polarity (CPOL)**: `Low` (SPI Mode 0)
+  - **Clock Phase (CPHA)**: `1 Edge` (SPI Mode 0)
+  - **Baud Rate**: 보드 최대 속도에 따라 분주비 자동 계산
 
-### USB
+#### **Connectivity -> USB_OTG_FS** (데스크톱 브리지 노드만 해당)
+- **Mode**: `Device_Only`
+- **Activate_VBUS**: `Disable` (PC 연결 시 감지선 미사용 시) 또는 회로 구성에 맞춤
 
-- USB_OTG_FS: Device Only
-- Middleware: USB_DEVICE
-- Class: Communication Device Class, CDC
+#### **Middleware -> USB_DEVICE** (데스크톱 브리지 노드만 해당)
+- **Class For FS IP**: `Communication Device Class (Virtual Port Com)` (CDC로 설정하여 가상 직렬 포트 생성)
 
-### GPIO
+---
 
-- `PA4`: GPIO Output, default HIGH
-- `PB0` 또는 실제 GDO0 핀: GPIO_EXTI Rising/Falling, Pull-down 또는 No pull
+### 2. Clock Configuration (클럭 트리 설정)
 
-처음 bring-up에서는 GDO0 EXTI 없이 polling만으로도 테스트 가능하다. EXTI는 RX 안정화 이후 붙인다.
+USB CDC 가상 포트를 안정적으로 사용하려면 **USB 클럭이 반드시 48 MHz**여야 합니다.
+
+1. **Input Frequency**: Nucleo 보드의 8MHz 외부 크리스탈(HSE) 또는 내부 HSI 선택
+2. **PLL Source Mux**: `HSE` 또는 `HSI`
+3. **System Clock Mux**: `PLLCLK` 선택하여 코어 클럭 최대치(F401RE 기준 84 MHz)로 설정
+4. **USB Clock Mux (To USB OTG FS)**: PLL의 48MHz 출력이 인가되도록 PLL 인자(`PLLM`, `PLLN`, `PLLQ`)를 조정
+   - 예: HSI (16MHz) -> /16 -> *336 -> /7 (PLLQ) = 48MHz USB clock 설정
+
+---
+
+### 3. Project Manager 설정 (코드 생성 옵션)
+
+- **Project** 탭:
+  - **Toolchain / IDE**: `STM32CubeIDE`
+- **Code Generator** 탭:
+  - **Generated files**: `Generate peripheral initialization as a pair of '.c/.h' files per peripheral` 체크 (각 장치별 드라이버 파일을 독립적으로 분리하여 소스 관리 가독성 향상)
+  - **Keep User Code when re-generating**: 항상 체크 상태로 유지하여 코드 재생성 시 기존 코드가 지워지지 않도록 보호
 
 ## Files To Copy Into CubeMX Project
 
@@ -258,7 +292,7 @@ MinGW나 Ninja 단일 구성 빌드라면 실행 파일 위치가 다를 수 있
 3. STM32 applies CC1101 RX mode.
 4. Desktop sends beacon every frame.
 5. STM32 transmits beacon through CC1101.
-6. Raspberry receives beacon or packet through CC1101.
+6. Gateway node receives beacon or packet through CC1101.
 7. STM32 polling finds received packet and sends `BRIDGE_EVT_RX_PACKET` to desktop.
 8. The RX event payload is `[radio_frame...][rssi][lqi]`.
 9. Desktop logs `TX_BEACON`, `RX_OK`, `RX_BAD`, or `TX_FAIL` to CSV.
@@ -279,10 +313,31 @@ MinGW나 Ninja 단일 구성 빌드라면 실행 파일 위치가 다를 수 있
 
 ## First Debug Checklist
 
-- `PARTNUM=0x00`, `VERSION=0x14` was already confirmed on Raspberry side before full-chain testing.
+- CC1101 registers and power configurations were already confirmed before full-chain testing.
 - STM32 CSN idles HIGH.
 - SPI mode is 0.
 - CC1101 VCC is 3.3V.
 - Desktop COM port matches Device Manager.
 - If desktop opens COM but no RF activity appears, check `CDC_Receive_FS()` is actually called.
-- If RF TX happens but Raspberry receives nothing, lower SPI speed and recheck RF preset/channel.
+- If RF TX happens but receiver node receives nothing, lower SPI speed and recheck RF preset/channel.
+
+## Standalone Nodes Setup (앵커 및 비행체 단독 노드 설정)
+
+데스크톱 PC 연결 없이 전원만 공급받아 단독으로 작동하는 앵커(Anchor) 및 비행체(Aircraft) 노드는 다음 사항을 다르게 적용합니다.
+
+### 1. CubeMX 설정 차이점
+- **USB CDC 비활성화 가능**: PC와의 통신이 필요 없으므로 `USB_OTG_FS` 및 `USB_DEVICE` 설정을 생략하여 전력 및 메모리를 절약할 수 있습니다.
+- **GPIO / SPI**: SPI1, CSN(PA4), GDO0(PB0) 등의 핀맵 설정은 브리지 보드와 동일하게 구성해야 합니다.
+
+### 2. 복사해야 할 필수 소스 파일 추가
+데스크톱 브리지와 달리 단독 노드는 보드 자체에서 TDMA 슬롯 스케줄링을 연산해야 하므로, 아래 공유 소스 코드를 프로젝트에 **반드시 추가**해야 합니다.
+- **Header 파일**: `include/tdma.h`, `include/tdma_runtime.h` 추가 복사
+- **Source 파일**: `common/tdma.c`, `common/tdma_runtime.c` 추가 복사
+
+### 3. 메인 동작 루프 (`main.c` 통합)
+USB CDC 브리지의 요청 처리 루프 대신, 단독 노드는 고유 타이머를 기반으로 TDMA 상태 머신을 구동해야 합니다. 
+이를 위해 `Core/Src/main.c`에 **[stm32_bridge/main_stm32.c](file:///c:/Users/5-13/home-lab/link16-tdma/stm32_bridge/main_stm32.c)**의 메인 루프 시퀀스를 통합하여 사용합니다:
+- `get_monotonic_us()` 등의 타이머 함수를 활용해 1us 단위의 시간 값을 획득합니다.
+- `tdma_runtime_tick()` 함수를 호출하여 매 순간 송신(TX)과 수신(RX)을 독립적으로 제어합니다.
+- `tdma_runtime_init(&tdma_runtime, <Node_Address>)`를 호출할 때 자신의 고유 하드웨어 주소(예: 0x22, 0x31)를 주입합니다.
+

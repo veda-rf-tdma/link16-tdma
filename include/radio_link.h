@@ -15,7 +15,7 @@ typedef struct radio_link radio_link_t;
 /**
  * @brief Open a concrete radio backend.
  *
- * This is a future abstraction point for STM32 bridge, Raspberry CC1101, or
+ * This is a future abstraction point for STM32 bridge or
  * another backend. It is declared but not implemented in the MVP.
  */
 int radio_link_open(radio_link_t *radio);

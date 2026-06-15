@@ -14,7 +14,6 @@
 
 #define TDMA_ADDR_BROADCAST   0xffu
 #define TDMA_ADDR_DESKTOP     0x00u
-#define TDMA_ADDR_RASPBERRY   0x10u
 #define TDMA_ADDR_STM32_NODE  0x20u
 #define TDMA_ADDR_BASE_1      0x21u
 #define TDMA_ADDR_BASE_2      0x22u
@@ -47,10 +46,7 @@
 #define ATPC_TARGET_MARGIN_DB 12.0
 #define ATPC_STEP_DB          2.0
 
-#define RPI_COMM1_SPI_DEV     "/dev/spidev0.0"
-#define RPI_COMM2_SPI_DEV     "/dev/spidev0.1"
-#define RPI_COMM1_GDO0_GPIO   24
-#define RPI_COMM2_GDO0_GPIO   25
+
 
 #define WIN_BRIDGE_BAUD       115200u
 

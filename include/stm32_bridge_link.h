@@ -3,11 +3,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+
+#ifndef __arm__
 #include "serial_win.h"
 
 typedef struct {
     serial_win_t serial;
 } stm32_bridge_link_t;
+#endif
 
 typedef enum {
     BRIDGE_CMD_SET_CONFIG = 1,
@@ -19,6 +22,7 @@ typedef enum {
     BRIDGE_EVT_ERROR = 0x83
 } bridge_msg_type_t;
 
+#ifndef __arm__
 /**
  * @brief Open the STM32 USB CDC radio bridge.
  *
@@ -78,5 +82,6 @@ int bridge_poll_packet_meta(stm32_bridge_link_t *link, uint8_t *data, size_t max
  * @param link Bridge connection state.
  */
 void bridge_close(stm32_bridge_link_t *link);
+#endif
 
 #endif

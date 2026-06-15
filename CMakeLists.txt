@@ -24,23 +24,12 @@ add_executable(tdma_desktop
 )
 target_link_libraries(tdma_desktop tdma_common)
 
-add_executable(tdma_raspberry
-    raspberry/main_raspberry.c
-    raspberry/spi_linux.c
-    raspberry/cc1101_linux.c
-)
-target_link_libraries(tdma_raspberry tdma_common)
 
-add_executable(tdma_raspberry_rx_logger
-    raspberry/rx_logger.c
-    raspberry/spi_linux.c
-    raspberry/cc1101_linux.c
-)
-target_link_libraries(tdma_raspberry_rx_logger tdma_common)
 
 add_executable(tdma_ekf_tracker
     analysis/ekf_tracker.c
 )
+target_link_libraries(tdma_ekf_tracker tdma_common)
 if(UNIX)
     target_link_libraries(tdma_ekf_tracker m)
 endif()

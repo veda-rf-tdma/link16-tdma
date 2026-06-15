@@ -65,8 +65,7 @@ tdma_node_role_t tdma_node_role(uint8_t node_id)
         return TDMA_NODE_ANCHOR_1;
     case TDMA_ANCHOR_2_ADDR:
         return TDMA_NODE_ANCHOR_2;
-    case TDMA_ADDR_RASPBERRY:
-        return TDMA_NODE_GATEWAY;
+
     case TDMA_ADDR_DESKTOP:
         return TDMA_NODE_DESKTOP;
     case TDMA_ADDR_UNASSIGNED:
@@ -87,8 +86,7 @@ const char *tdma_node_role_name(tdma_node_role_t role)
         return "ANCHOR_1";
     case TDMA_NODE_ANCHOR_2:
         return "ANCHOR_2";
-    case TDMA_NODE_GATEWAY:
-        return "GATEWAY";
+
     case TDMA_NODE_DESKTOP:
         return "DESKTOP";
     case TDMA_NODE_UNASSIGNED:

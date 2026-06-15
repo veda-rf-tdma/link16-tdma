@@ -3,3 +3,5 @@ build_new/
 *.csv
 *.log
 desktop_master_log.csv
+analysis_out/
+archive_data/
