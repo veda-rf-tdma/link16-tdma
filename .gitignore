@@ -5,3 +5,5 @@ build_new/
 desktop_master_log.csv
 analysis_out/
 archive_data/
+analysis/legacy/
+stm32_bridge/anchor_project/
