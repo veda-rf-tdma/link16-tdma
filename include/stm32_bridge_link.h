@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "usb_cdc_bridge.h"
 
 #ifndef __arm__
 #include "serial_win.h"
@@ -11,16 +12,6 @@ typedef struct {
     serial_win_t serial;
 } stm32_bridge_link_t;
 #endif
-
-typedef enum {
-    BRIDGE_CMD_SET_CONFIG = 1,
-    BRIDGE_CMD_TX_PACKET = 2,
-    BRIDGE_CMD_START_RX = 3,
-    BRIDGE_CMD_GET_STATUS = 4,
-    BRIDGE_EVT_RX_PACKET = 0x81,
-    BRIDGE_EVT_TX_DONE = 0x82,
-    BRIDGE_EVT_ERROR = 0x83
-} bridge_msg_type_t;
 
 #ifndef __arm__
 /**

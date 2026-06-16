@@ -34,6 +34,45 @@ static int get_keypress(void)
 #endif
 }
 
+#include <stdarg.h>
+
+#ifdef _WIN32
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+static void enable_ansi_support(void) {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE) return;
+    DWORD dwMode = 0;
+    if (!GetConsoleMode(hOut, &dwMode)) return;
+    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    SetConsoleMode(hOut, dwMode);
+}
+#endif
+
+#define EVENT_LOG_SIZE 5
+static char event_logs[EVENT_LOG_SIZE][128];
+static int event_log_count = 0;
+
+static void add_event_log(const char *format, ...) {
+    char buf[128];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(buf, sizeof(buf), format, args);
+    va_end(args);
+
+    // Shift logs to make room for newest at top (index 0)
+    for (int i = EVENT_LOG_SIZE - 1; i > 0; i--) {
+        strncpy(event_logs[i], event_logs[i-1], sizeof(event_logs[i]) - 1);
+        event_logs[i][sizeof(event_logs[i]) - 1] = '\0';
+    }
+    strncpy(event_logs[0], buf, sizeof(event_logs[0]) - 1);
+    event_logs[0][sizeof(event_logs[0]) - 1] = '\0';
+    if (event_log_count < EVENT_LOG_SIZE) {
+        event_log_count++;
+    }
+}
+
 typedef enum {
     MODE_LIVENESS_MONITOR,
     MODE_ACTIVE_TRACKING
@@ -94,6 +133,64 @@ static void format_timestamp(char *out, size_t out_len)
     strftime(out, out_len, "%Y-%m-%d %H:%M:%S", &tm_now);
 }
 
+static void draw_dashboard(uint16_t frame_no, const char *port, const char *log_path, tdma_node_table_t *table)
+{
+    // Move cursor to top-left (flicker-free redraw)
+    printf("\033[H");
+
+    printf("======================================================================\n");
+    printf("                  TDMA RADIO MASTER SYSTEM MONITOR                    \n");
+    printf("======================================================================\n");
+    printf(" Port: %-8s | Frame No: %-6u | Log: %s\033[K\n", port, frame_no, log_path);
+    printf("======================================================================\n\n");
+
+    printf(" [NODE STATUS]\n");
+    printf("  - Master (0x21)   : [  OK  ] (Role: Beacon Master)\033[K\n");
+    
+    tdma_node_t *mob = node_table_find(table, TDMA_ADDR_MOBILE_1);
+    const char *mob_status = (mob && mob->state == TDMA_NODE_STATE_ACTIVE) ? "ACTIVE" : "LOST  ";
+    printf("  - Aircraft (0x31) : [%s] (Role: Mobile Node)\033[K\n", mob_status);
+
+    const char *a1_status = (desktop_active_mask & (1 << 2)) ? "ACTIVE" : "LOST  ";
+    printf("  - Anchor 1 (0x22) : [%s] (Role: Ranging Anchor)\033[K\n", a1_status);
+
+    const char *a2_status = (desktop_active_mask & (1 << 3)) ? "ACTIVE" : "LOST  ";
+    printf("  - Anchor 2 (0x23) : [%s] (Role: Ranging Anchor)\033[K\n\n", a2_status);
+
+    printf(" [SYSTEM PARAMETERS]\n");
+    printf("  - Frame Period    : %-7lu us (Slot Duration: %lu us)\033[K\n", 
+           (unsigned long)desktop_frame_period_us, (unsigned long)desktop_slot_us);
+    printf("  - EKF Mode        : %s\033[K\n\n", 
+           (current_desktop_mode == MODE_ACTIVE_TRACKING) ? "ACTIVE_TRACKING" : "LIVENESS_MONITOR");
+
+    printf(" [EKF TARGET ESTIMATION (Apollonius Seq EKF)]\n");
+    if (desktop_ekf_initialized) {
+        double uncertainty = sqrt(desktop_ekf.P[0][0] + desktop_ekf.P[1][1]);
+        printf("  - Target Position : ( %6.2f, %6.2f ) meters\033[K\n", 
+               desktop_ekf.state[0], desktop_ekf.state[1]);
+        printf("  - Estimation Error: %.3f m\033[K\n\n", uncertainty);
+    } else {
+        printf("  - Target Position : (   N/A,   N/A ) (Wait for setup 's')\033[K\n");
+        printf("  - Estimation Error: N/A\033[K\n\n");
+    }
+
+    printf(" [RECENT LOG EVENTS]\n");
+    for (int i = 0; i < EVENT_LOG_SIZE; i++) {
+        if (i < event_log_count) {
+            printf("  > %s\033[K\n", event_logs[i]);
+        } else {
+            printf("  > \033[K\n");
+        }
+    }
+    printf("\n");
+
+    printf("======================================================================\n");
+    printf("  [s] Configure anchor coordinates   [t] Inject LED command   [q] Exit\n");
+    printf("======================================================================\n");
+    fflush(stdout);
+}
+
+
 /**
  * @brief Build a TDMA master beacon payload for one frame.
  *
@@ -143,7 +240,7 @@ static void log_event(FILE *log, const char *event, uint16_t frame_no, const cha
     char ts[32];
     uint8_t channel = tdma_channel_for_slot(frame_no, TDMA_SLOT_MASTER_BEACON);
     format_timestamp(ts, sizeof(ts));
-    printf("%s frame=%u %s\n", event, frame_no, detail ? detail : "");
+    add_event_log("%-14s Frame %u: %s", event, frame_no, detail ? detail : "");
     if (log) {
         fprintf(log, "%s,%s,%u,0x%02x,%s,0x%02x,%s,%u,%s,%u,,,,%s\n",
                 ts, event, frame_no,
@@ -223,7 +320,7 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
              "addr=0x%02x type=%u src=0x%02x dst=0x%02x packet_frame=%u slot=%u payload_len=%u rssi_raw=0x%02x rssi=%.1f dBm lqi=0x%02x est_distance=%.2f m",
              radio_frame[0], pkt.type, pkt.src, pkt.dst, pkt.frame_no, pkt.slot_no,
              pkt.payload_len, rssi, rssi_dbm, lqi, distance_m);
-    printf("RX_OK frame=%u %s\n", frame_no, detail);
+    add_event_log("RX_OK          Frame %u: Src=0x%02x RSSI=%.1f LQI=%u", frame_no, pkt.src, rssi_dbm, lqi);
     if (log) {
         char ts[32];
         format_timestamp(ts, sizeof(ts));
@@ -253,8 +350,8 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
                 existing->state = TDMA_NODE_STATE_ACTIVE;
                 assigned_addr = existing->node_id;
                 assigned_slot = existing->slot_no;
-                printf("[MASTER] Rejoin request from UID %s: Resending Address: 0x%02x, Slot: %u\n",
-                       uid_hex, assigned_addr, assigned_slot);
+                add_event_log("[JOIN] Rejoin UID %s: Addr 0x%02x, Slot %u",
+                              uid_hex, assigned_addr, assigned_slot);
             } else {
                 assigned_addr = allocate_address(table, &assigned_slot);
                 if (assigned_addr != 0) {
@@ -265,11 +362,11 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
                         new_node->slot_no = assigned_slot;
                         new_node->state = TDMA_NODE_STATE_ACTIVE;
                         new_node->frames_since_seen = 0;
-                        printf("[MASTER] New join request from UID %s: Assigned Address: 0x%02x, Slot: %u\n",
-                               uid_hex, assigned_addr, assigned_slot);
+                        add_event_log("[JOIN] New join UID %s: Addr 0x%02x, Slot %u",
+                                      uid_hex, assigned_addr, assigned_slot);
                     }
                 } else {
-                    printf("[MASTER] New join request from UID %s REJECTED: no available address/slot\n", uid_hex);
+                    add_event_log("[JOIN] New join UID %s REJECTED: no slots", uid_hex);
                 }
             }
 
@@ -299,7 +396,7 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
                 if (send_rc == 0) {
                     log_event(log, "TX_JOIN_ACCEPT", frame_no, "sent");
                 } else {
-                    printf("[MASTER] Failed to send JOIN_ACCEPT: rc=%d\n", send_rc);
+                    add_event_log("[JOIN] Failed to send JOIN_ACCEPT: rc=%d", send_rc);
                 }
             }
         }
@@ -309,7 +406,7 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
             sender->frames_since_seen = 0;
             if (sender->state == TDMA_NODE_STATE_SUSPECT || sender->state == TDMA_NODE_STATE_LOST) {
                 sender->state = TDMA_NODE_STATE_ACTIVE;
-                printf("[MASTER] Node 0x%02x recovered to ACTIVE\n", pkt.src);
+                add_event_log("[NODE] Node 0x%02x recovered to ACTIVE", pkt.src);
             }
         }
         if (pkt.type == TDMA_PKT_DATA && pkt.src == TDMA_AIRCRAFT_ADDR) {
@@ -513,11 +610,7 @@ static void run_desktop_ekf_cycle(uint16_t frame_no, FILE *log)
 
     desktop_est_x_cm = (int16_t)(desktop_ekf.state[0] * 100.0);
     desktop_est_y_cm = (int16_t)(desktop_ekf.state[1] * 100.0);
-
     double uncertainty = sqrt(desktop_ekf.P[0][0] + desktop_ekf.P[1][1]);
-    printf("[EKF] Frame %u: Est Target Position=(%.2f, %.2f) m, Uncertainty=%.3f\n",
-           frame_no, desktop_ekf.state[0], desktop_ekf.state[1], uncertainty);
-
     if (log) {
         char ts[32];
         format_timestamp(ts, sizeof(ts));
@@ -544,8 +637,26 @@ static void run_desktop_ekf_cycle(uint16_t frame_no, FILE *log)
  */
 int main(int argc, char **argv)
 {
-    const char *port = (argc > 1) ? argv[1] : "COM3";
-    unsigned long frame_count = (argc > 2) ? strtoul(argv[2], 0, 10) : 100;
+    const char *port_arg = (argc > 1) ? argv[1] : "COM3";
+    char port_buf[64];
+    const char *port = port_arg;
+
+#ifdef _WIN32
+    // If the port argument is numeric (e.g. "3"), auto-prefix it with "COM"
+    int is_numeric = 1;
+    for (int idx = 0; port_arg[idx] != '\0'; idx++) {
+        if (port_arg[idx] < '0' || port_arg[idx] > '9') {
+            is_numeric = 0;
+            break;
+        }
+    }
+    if (is_numeric && port_arg[0] != '\0') {
+        snprintf(port_buf, sizeof(port_buf), "COM%s", port_arg);
+        port = port_buf;
+    }
+#endif
+
+    unsigned long frame_count = (argc > 2) ? strtoul(argv[2], 0, 10) : 0; // default to 0 (infinite)
     const char *log_path = (argc > 3) ? argv[3] : "desktop_master_log.csv";
     stm32_bridge_link_t bridge;
     FILE *log = fopen(log_path, "a");
@@ -579,13 +690,13 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    printf("desktop master started: port=%s frames=%lu log=%s\n", port, frame_count, log_path);
-    printf("=========================================================================\n");
-    printf("[MODE] Liveness Monitoring Phase. Active nodes will print below.\n");
-    printf("Press 's' to configure coordinates and start real-time EKF positioning.\n");
-    printf("=========================================================================\n\n");
+#ifdef _WIN32
+    enable_ansi_support();
+#endif
+    // Clear screen once at startup
+    printf("\033[2J\033[H");
 
-    for (unsigned long i = 0; i < frame_count; i++) {
+    for (unsigned long i = 0; (frame_count == 0) || (i < frame_count); i++) {
         uint16_t frame_no = (uint16_t)i;
         
         // Tick timeouts for dynamic nodes
@@ -603,13 +714,7 @@ int main(int argc, char **argv)
         }
         desktop_active_mask = next_mask;
 
-        /* Print liveness periodically in MONITOR mode */
-        if (current_desktop_mode == MODE_LIVENESS_MONITOR && i % 10 == 0) {
-            printf("[LIVENESS] Frame %u - Active Nodes: Master(0x21): OK, Aircraft(0x31): OK, Anchor1(0x22): %s, Anchor2(0x23): %s\n",
-                   frame_no, 
-                   (desktop_active_mask & (1 << 2)) ? "ACTIVE" : "LOST/OFFLINE",
-                   (desktop_active_mask & (1 << 3)) ? "ACTIVE" : "LOST/OFFLINE");
-        }
+
 
         /* Check for keyboard trigger */
         if (check_keypress()) {
@@ -618,6 +723,10 @@ int main(int argc, char **argv)
                 desktop_led_command_active = 1;
                 desktop_led_command_frame_counter = 5;
                 printf("\n[LED] Toggle command injected (will transmit for 5 frames)!\n");
+            }
+            else if (key == 'q' || key == 'Q') {
+                printf("\n[EXIT] Exiting program cleanly...\n");
+                break;
             }
             else if (current_desktop_mode == MODE_LIVENESS_MONITOR && (key == 's' || key == 'S')) {
                 printf("\n=========================================================\n");
@@ -711,9 +820,7 @@ int main(int argc, char **argv)
                     desktop_ekf_initialized = 1;
                     current_desktop_mode = MODE_ACTIVE_TRACKING;
 
-                    printf("\n=========================================================\n");
-                    printf("[TRACKING] Real-time EKF positioning activated.\n");
-                    printf("=========================================================\n\n");
+                    add_event_log("[MODE] Active EKF tracking mode activated");
                 }
             }
         }
@@ -734,33 +841,33 @@ int main(int argc, char **argv)
                     if (desktop_frame_period_us > min_limit) {
                         desktop_last_stable_period = desktop_frame_period_us;
                         desktop_frame_period_us -= 10000u;
-                        printf("[TUNER] PDR=%.2f: stable, shrinking frame period to %lu us\n", pdr, (unsigned long)desktop_frame_period_us);
+                        add_event_log("[TUNER] PDR=%.2f: stable, shrinking period to %lu us", pdr, (unsigned long)desktop_frame_period_us);
                     } else {
                         if (desktop_slot_us > 5000u) { /* 5ms limit */
                             desktop_slot_us -= 1000u;
                             desktop_frame_period_us = total_slots * desktop_slot_us;
-                            printf("[TUNER] PDR=%.2f: shrinking slot width to %lu us\n", pdr, (unsigned long)desktop_slot_us);
+                            add_event_log("[TUNER] PDR=%.2f: shrinking slot width to %lu us", pdr, (unsigned long)desktop_slot_us);
                         } else {
                             desktop_tuner_state = D_TUNING_LOCKED;
-                            printf("[TUNER] PDR=%.2f: Reached absolute physical limits. Locked settings.\n", pdr);
+                            add_event_log("[TUNER] PDR=%.2f: Reached physical limits. Locked.", pdr);
                         }
                     }
                 } else if (pdr < 0.90) {
                     if (desktop_slot_us < 10000u) {
                         desktop_slot_us = 10000u;
                         desktop_frame_period_us = total_slots * desktop_slot_us;
-                        printf("[TUNER] PDR=%.2f: Unstable, rollbacked slot width to 10ms\n", pdr);
+                        add_event_log("[TUNER] PDR=%.2f: Unstable, rollbacked slot to 10ms", pdr);
                     } else if (desktop_frame_period_us < TDMA_FRAME_PERIOD_US) {
                         desktop_frame_period_us += 10000u;
                         desktop_last_stable_period = desktop_frame_period_us;
-                        printf("[TUNER] PDR=%.2f: dropped, expanding frame period to %lu us\n", pdr, (unsigned long)desktop_frame_period_us);
+                        add_event_log("[TUNER] PDR=%.2f: dropped, expanding period to %lu us", pdr, (unsigned long)desktop_frame_period_us);
                     } else {
                         desktop_tuner_state = D_TUNING_LOCKED;
-                        printf("[TUNER] PDR=%.2f: At maximum limit, locking period\n", pdr);
+                        add_event_log("[TUNER] PDR=%.2f: At maximum limit, locking period", pdr);
                     }
                 } else {
                     desktop_tuner_state = D_TUNING_LOCKED;
-                    printf("[TUNER] PDR=%.2f: Settled in marginal zone, locking settings\n", pdr);
+                    add_event_log("[TUNER] PDR=%.2f: Settled, locking settings", pdr);
                 }
             }
             desktop_tuner_rx_packets = 0;
@@ -787,6 +894,9 @@ int main(int argc, char **argv)
         if (current_desktop_mode == MODE_ACTIVE_TRACKING) {
             run_desktop_ekf_cycle(frame_no, log);
         }
+
+        /* Draw/Refresh the console TUI dashboard */
+        draw_dashboard(frame_no, port, log_path, &master_node_table);
     }
 
     bridge_close(&bridge);

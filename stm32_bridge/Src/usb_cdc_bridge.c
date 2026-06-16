@@ -1,7 +1,6 @@
 #include "usb_cdc_bridge.h"
 #include "cc1101_stm32.h"
 #include "protocol.h"
-#include "stm32_bridge_link.h"
 
 enum {
     BRIDGE_MAGIC = 0xa5u,
