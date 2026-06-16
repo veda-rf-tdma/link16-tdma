@@ -36,7 +36,7 @@ typedef uint32_t HAL_StatusTypeDef;
 #ifndef GPIOA
 #define GPIOA ((void*)0x40020000)
 #define GPIOC ((void*)0x40020800)
-#define GPIO_PIN_5   ((uint16_t)0x0020) /* PA5 LED */
+#define GPIO_PIN_8   ((uint16_t)0x0100) /* PA8 LED (Avoids conflict with PA5 SPI1_SCK) */
 #define GPIO_PIN_13  ((uint16_t)0x2000) /* PC13 Button */
 #endif
 
@@ -373,7 +373,7 @@ static void process_received_packet(void)
                 uint8_t current_led_cmd = (beacon_payload.slot_table_version & 0x80) ? 1 : 0;
                 if (current_led_cmd != last_led_cmd) {
                     last_led_cmd = current_led_cmd;
-                    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+                    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8);
                     log_telemetry("LED: Master command triggered LED Toggle.\r\n");
                 }
             }
@@ -414,7 +414,7 @@ static void process_received_packet(void)
                 uint8_t current_led_cmd = (beacon_payload.slot_table_version & 0x80) ? 1 : 0;
                 if (current_led_cmd != last_led_cmd) {
                     last_led_cmd = current_led_cmd;
-                    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
+                    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8);
                     log_telemetry("LED: Master command triggered LED Toggle.\r\n");
                 }
   
@@ -544,10 +544,10 @@ int main(void)
         ekf_init(&ekf_inst, 2.5, 2.165);
     }
 
-    /* Turn ON user LED PA5 initially on Anchor nodes to signal active status */
+    /* Turn ON user LED PA8 initially on Anchor nodes to signal active status */
     if (tdma_runtime.local_node_id == TDMA_ANCHOR_1_ADDR || 
         tdma_runtime.local_node_id == TDMA_ANCHOR_2_ADDR) {
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
     }
     
     log_telemetry("INFO: TDMA runtime initialized\r\n");
@@ -564,7 +564,7 @@ int main(void)
                 anchor_enabled = !anchor_enabled;
                 
                 /* Toggle LED status to reflect anchor state */
-                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, anchor_enabled ? GPIO_PIN_SET : GPIO_PIN_RESET);
+                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, anchor_enabled ? GPIO_PIN_SET : GPIO_PIN_RESET);
                 
                 if (anchor_enabled) {
                     log_telemetry("ANCHOR: Manually ENABLED. LED ON.\r\n");
