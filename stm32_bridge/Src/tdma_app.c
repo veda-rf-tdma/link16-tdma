@@ -227,12 +227,12 @@ static void process_received_packet(void)
                 if (tdma_decode_aircraft_data(packet.payload, packet.payload_len, &echo_payload) == 0) {
                     char log_buf[256];
                     snprintf(log_buf, sizeof(log_buf),
-                             "%lu,ECHO_OK,%u,%d,%d,%d,%d,%.1f\r\n",
+                             "%lu,ECHO_OK,%u,%d,%d,%d,%d,%d.%d\r\n",
                              (unsigned long)(get_monotonic_us() / 1000),
                              packet.frame_no,
                              last_rx_x_cm, last_rx_y_cm,           /* Master's calculated coordinates */
                              echo_payload.echoed_x_cm, echo_payload.echoed_y_cm, /* Coordinates echoed back by Aircraft */
-                             rssi_dbm);
+                             (int)rssi_dbm, (int)(fabs(rssi_dbm) * 10.0) % 10);
                     log_telemetry(log_buf);
                 }
             }
@@ -250,12 +250,12 @@ static void process_received_packet(void)
                     master_last_processed_aircraft_frame = packet.frame_no;
                     char log_buf[256];
                     snprintf(log_buf, sizeof(log_buf),
-                             "%lu,RELAY_OK,%u,%d,%d,%d,%d,%.1f,via_0x%02x\r\n",
+                             "%lu,RELAY_OK,%u,%d,%d,%d,%d,%d.%d,via_0x%02x\r\n",
                              (unsigned long)(get_monotonic_us() / 1000),
                              packet.frame_no,
                              last_rx_x_cm, last_rx_y_cm,
                              report.relayed_data.echoed_x_cm, report.relayed_data.echoed_y_cm,
-                             rssi_dbm, packet.src);
+                             (int)rssi_dbm, (int)(fabs(rssi_dbm) * 10.0) % 10, packet.src);
                     log_telemetry(log_buf);
                 }
             }
@@ -273,12 +273,12 @@ static void process_received_packet(void)
                     master_last_processed_aircraft_frame = packet.frame_no;
                     char log_buf[256];
                     snprintf(log_buf, sizeof(log_buf),
-                             "%lu,RELAY_OK,%u,%d,%d,%d,%d,%.1f,via_0x%02x\r\n",
+                             "%lu,RELAY_OK,%u,%d,%d,%d,%d,%d.%d,via_0x%02x\r\n",
                              (unsigned long)(get_monotonic_us() / 1000),
                              packet.frame_no,
                              last_rx_x_cm, last_rx_y_cm,
                              report.relayed_data.echoed_x_cm, report.relayed_data.echoed_y_cm,
-                             rssi_dbm, packet.src);
+                             (int)rssi_dbm, (int)(fabs(rssi_dbm) * 10.0) % 10, packet.src);
                     log_telemetry(log_buf);
                 }
             }
