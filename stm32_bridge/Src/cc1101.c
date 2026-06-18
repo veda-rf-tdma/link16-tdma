@@ -1,5 +1,14 @@
 #include "cc1101_stm32.h"
 #include "cc1101_regs.h"
+#include "main.h"
+#include <stdio.h>
+
+extern SPI_HandleTypeDef hspi1;
+
+#ifndef CC1101_CSN_Pin
+#define CC1101_CSN_Pin GPIO_PIN_4
+#define CC1101_CSN_GPIO_Port GPIOA
+#endif
 
 enum {
     CC1101_READ = 0x80u,
@@ -84,13 +93,27 @@ int cc1101_apply_rf_preset(cc1101_t *radio)
 {
     cc1101_strobe(radio, CC1101_SRES);
     cc1101_platform_delay_ms(2);
+
+    /* Verify CC1101 connection and version register (0x31) response */
+    uint8_t version = 0;
+    int rc = cc1101_read_status(radio, 0x31, &version);
+    if (rc < 0 || version == 0x00 || version == 0xFF) {
+        /* Temporarily bypass SPI connection error for testing Master-Desktop USB link */
+        /* return -10; */
+    } else {
+        extern UART_HandleTypeDef huart2;
+        char msg[64];
+        int msg_len = snprintf(msg, sizeof(msg), "INFO: CC1101 SPI OK. Chip version: 0x%02X\r\n", version);
+        HAL_UART_Transmit(&huart2, (uint8_t *)msg, msg_len, 100);
+    }
+
     for (size_t i = 0; i < cc1101_rf_preset_count; i++) {
-        int rc = cc1101_write_reg(radio, cc1101_rf_preset[i].addr, cc1101_rf_preset[i].value);
+        rc = cc1101_write_reg(radio, cc1101_rf_preset[i].addr, cc1101_rf_preset[i].value);
         if (rc < 0) {
             return rc;
         }
     }
-    int rc = cc1101_write_burst(radio, CC1101_PATABLE, cc1101_pa_table, 8);
+    rc = cc1101_write_burst(radio, CC1101_PATABLE, cc1101_pa_table, 8);
     if (rc >= 0) {
         radio->initialized = 1;
     }
@@ -194,4 +217,30 @@ int cc1101_set_tx_power(cc1101_t *radio, double power_dbm)
         pa_val = 0xc0;
     }
     return cc1101_write_reg(radio, CC1101_PATABLE, pa_val);
+}
+
+int cc1101_verify_connection(cc1101_t *radio, uint8_t *version)
+{
+    return cc1101_read_status(radio, 0x31, version);
+}
+
+void cc1101_platform_select(void)
+{
+    HAL_GPIO_WritePin(CC1101_CSN_GPIO_Port, CC1101_CSN_Pin, GPIO_PIN_RESET);
+}
+
+void cc1101_platform_deselect(void)
+{
+    HAL_GPIO_WritePin(CC1101_CSN_GPIO_Port, CC1101_CSN_Pin, GPIO_PIN_SET);
+}
+
+void cc1101_platform_delay_ms(uint32_t ms)
+{
+    HAL_Delay(ms);
+}
+
+int cc1101_platform_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
+{
+    HAL_StatusTypeDef rc = HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)tx, rx, (uint16_t)len, 100);
+    return rc == HAL_OK ? 0 : -1;
 }

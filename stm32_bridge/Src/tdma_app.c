@@ -15,6 +15,10 @@
 extern SPI_HandleTypeDef hspi1;
 extern TIM_HandleTypeDef htim2;
 
+#ifdef HAL_I2C_MODULE_ENABLED
+extern I2C_HandleTypeDef hi2c1;
+#endif
+
 /* Robust fallbacks if CubeMX user labels are missing */
 #ifndef CC1101_GDO0_Pin
 #define CC1101_GDO0_Pin GPIO_PIN_0
@@ -74,29 +78,7 @@ static uint8_t anchor_measured_rssi = 0;
 static uint8_t anchor_measured_lqi = 0;
 static int anchor_has_measurement = 0;
 
-/* Platform Glue Implementations - No copy paste required! */
-void cc1101_platform_select(void)
-{
-    /* Pull CSN Low (Active) using CubeMX macro */
-    HAL_GPIO_WritePin(CC1101_CSN_GPIO_Port, CC1101_CSN_Pin, GPIO_PIN_RESET);
-}
 
-void cc1101_platform_deselect(void)
-{
-    /* Pull CSN High (Idle) using CubeMX macro */
-    HAL_GPIO_WritePin(CC1101_CSN_GPIO_Port, CC1101_CSN_Pin, GPIO_PIN_SET);
-}
-
-void cc1101_platform_delay_ms(uint32_t ms)
-{
-    HAL_Delay(ms);
-}
-
-int cc1101_platform_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
-{
-    HAL_StatusTypeDef rc = HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)tx, rx, (uint16_t)len, 100);
-    return rc == HAL_OK ? 0 : -1;
-}
 
 uint64_t get_monotonic_us(void)
 {
@@ -444,6 +426,60 @@ static void transmit_slot_packet(void)
     }
 }
 
+static void run_hardware_diagnostics(void)
+{
+    log_telemetry("\r\n==================================================\r\n");
+    log_telemetry("[HARDWARE DIAGNOSTICS] Booting Flight System...\r\n");
+    log_telemetry("--------------------------------------------------\r\n");
+
+    /* 1. SPI CC1101 module check */
+    uint8_t cc_ver = 0;
+    int cc_rc = cc1101_verify_connection(&radio, &cc_ver);
+    if (cc_rc == 0 && cc_ver != 0x00 && cc_ver != 0xFF) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "  SPI CC1101: OK (Chip Version: 0x%02X)\r\n", cc_ver);
+        log_telemetry(msg);
+    } else {
+        log_telemetry("  SPI CC1101: ERROR (Not connected or wiring issue!)\r\n");
+    }
+
+    /* 2. I2C Accelerometer (MPU6050) check */
+#ifdef HAL_I2C_MODULE_ENABLED
+    uint8_t mpu_ok = 0;
+    uint8_t mpu_addr = 0;
+    uint8_t mpu_val = 0;
+
+    /* Check MPU6050 address 0x68 and 0x69 */
+    if (HAL_I2C_IsDeviceReady(&hi2c1, (0x68 << 1), 3, 50) == HAL_OK) {
+        mpu_addr = 0x68 << 1;
+        mpu_ok = 1;
+    } else if (HAL_I2C_IsDeviceReady(&hi2c1, (0x69 << 1), 3, 50) == HAL_OK) {
+        mpu_addr = 0x69 << 1;
+        mpu_ok = 1;
+    }
+
+    if (mpu_ok) {
+        /* Read WHO_AM_I register (0x75) */
+        HAL_StatusTypeDef i2c_rc = HAL_I2C_Mem_Read(&hi2c1, mpu_addr, 0x75, I2C_MEMADD_SIZE_8BIT, &mpu_val, 1, 50);
+        if (i2c_rc == HAL_OK && (mpu_val == 0x68 || mpu_val == 0x70 || mpu_val == 0x71 || mpu_val == 0x72 || mpu_val == 0x73)) {
+            char msg[80];
+            snprintf(msg, sizeof(msg), "  I2C Accel (MPU6050): OK (Addr: 0x%02X, WHO_AM_I: 0x%02X)\r\n", mpu_addr >> 1, mpu_val);
+            log_telemetry(msg);
+        } else {
+            char msg[80];
+            snprintf(msg, sizeof(msg), "  I2C Accel (MPU6050): ERROR (Address ACKed, but WHO_AM_I failed: 0x%02X)\r\n", mpu_val);
+            log_telemetry(msg);
+        }
+    } else {
+        log_telemetry("  I2C Accel (MPU6050): ERROR (Not connected or wiring issue!)\r\n");
+    }
+#else
+    log_telemetry("  I2C Accel (MPU6050): SKIPPED (I2C1 peripheral not configured in CubeMX)\r\n");
+#endif
+
+    log_telemetry("==================================================\r\n\r\n");
+}
+
 /**
  * @brief Initialize the TDMA application on the STM32.
  */
@@ -451,6 +487,9 @@ void tdma_app_init(void)
 {
     /* 1. Ensure CC1101 CSN is high initially */
     cc1101_platform_deselect();
+    
+    /* Run connection check and diagnostic logs first */
+    run_hardware_diagnostics();
     
     /* 2. Apply CC1101 RF Presets */
     if (cc1101_apply_rf_preset(&radio) != 0) {
@@ -463,9 +502,17 @@ void tdma_app_init(void)
     
     /* 
      * Configure local node address dynamically or statically.
-     * Statically set to Aircraft (0x31) in this skeleton. Alter this for Master or Anchor.
      */
+#if defined(NODE_ROLE_AIRCRAFT)
     tdma_runtime_init(&tdma_runtime, TDMA_AIRCRAFT_ADDR);
+#elif defined(NODE_ROLE_ANCHOR_1)
+    tdma_runtime_init(&tdma_runtime, TDMA_ANCHOR_1_ADDR);
+#elif defined(NODE_ROLE_ANCHOR_2)
+    tdma_runtime_init(&tdma_runtime, TDMA_ANCHOR_2_ADDR);
+#else
+    /* Default fallback */
+    tdma_runtime_init(&tdma_runtime, TDMA_AIRCRAFT_ADDR);
+#endif
     
     /* 4. Initialize EKF and Master sync states */
     if (tdma_runtime.local_node_id == TDMA_MASTER_ADDR) {

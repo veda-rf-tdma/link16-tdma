@@ -20,5 +20,6 @@ int cc1101_poll_packet(cc1101_t *radio, uint8_t *data, size_t max_len,
                        uint8_t *rssi, uint8_t *lqi);
 int cc1101_set_channel(cc1101_t *radio, uint8_t channel);
 int cc1101_set_tx_power(cc1101_t *radio, double power_dbm);
+int cc1101_verify_connection(cc1101_t *radio, uint8_t *version);
 
 #endif

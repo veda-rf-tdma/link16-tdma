@@ -17,5 +17,6 @@ typedef enum {
 int usb_cdc_bridge_init(void);
 int usb_cdc_bridge_parse(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len);
 int usb_cdc_bridge_poll_radio(uint8_t *out, size_t out_len);
+void usb_cdc_bridge_tick(void);
 
 #endif

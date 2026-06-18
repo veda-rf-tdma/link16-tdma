@@ -162,3 +162,17 @@ python stm32_bridge/pack_stm32.py
 * **원인:** CubeMX에서 수신 인터럽트용 GPIO 핀(예: PB0)의 **User Label**을 `CC1101_GDO0`으로 지정하지 않은 상태입니다.
 * **해결:** CubeMX로 돌아가 해당 핀의 Label을 `CC1101_GDO0`으로 지정하거나, `tdma_app.c` 최상단에 `#define CC1101_GDO0_Pin GPIO_PIN_0` 처럼 수동 정의를 추가해 주면 해결됩니다.
 
+---
+
+## 7. Keil 32KB 용량 제한 해결을 위한 소스 파일 제외 가이드
+
+Keil uVision 평가판(Evaluation/Lite Edition)의 32KB 코드 크기 제한 에러(`L6047U`)가 발생할 경우, 각 역할 보드 빌드 시 아래 표를 기준으로 불필요한 C 소스 파일들을 빌드 대상에서 제외(`Exclude`)해 주십시오.
+
+### 파일 제외 방법:
+- Keil 좌측 Project 트리에서 대상 파일 우클릭 -> **Options for File** 클릭 -> **Include in Target Build** 체크박스 해제.
+
+| 빌드 대상 (Keil Define 매크로) | 빌드에서 제외할 파일 목록 (Exclude 대상 C 파일) |
+| :--- | :--- |
+| **마스터 브릿지 보드**<br>(`NODE_ROLE_MASTER`) | - `tdma_app.c`<br>- `ekf.c`<br>- `tdma.c`<br>- `tdma_runtime.c`<br>- `node_table.c`<br>- `radio_metrics.c` |
+| **비행체 및 앵커 노드 보드**<br>(`NODE_ROLE_AIRCRAFT` 등) | - `usb_cdc_bridge.c`<br>- **ST USB 라이브러리 관련 파일 일체** (`usb_device.c`, `usbd_cdc_if.c`, `usbd_conf.c`, `usbd_cdc.c`, `usbd_core.c`, `usbd_ctlreq.c`, `usbd_ioreq.c` 등) |
+

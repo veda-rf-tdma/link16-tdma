@@ -1,6 +1,11 @@
 #include "usb_cdc_bridge.h"
 #include "cc1101_stm32.h"
 #include "protocol.h"
+#include "main.h"
+#include <string.h>
+
+static uint8_t rx_buf[128];
+static int rx_idx = 0;
 
 enum {
     BRIDGE_MAGIC = 0xa5u,
@@ -49,7 +54,14 @@ static int bridge_error(uint8_t code, uint8_t *out, size_t out_len)
 
 int usb_cdc_bridge_init(void)
 {
-    return cc1101_apply_rf_preset(&bridge_radio);
+    int rc = cc1101_apply_rf_preset(&bridge_radio);
+    extern UART_HandleTypeDef huart2;
+    if (rc >= 0) {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"MASTER_BOOT_OK\r\n", 16, 100);
+    } else {
+        HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: Master CC1101 init failed\r\n", 34, 100);
+    }
+    return rc;
 }
 
 int usb_cdc_bridge_parse(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len)
@@ -101,4 +113,56 @@ int usb_cdc_bridge_poll_radio(uint8_t *out, size_t out_len)
     payload[n + 1] = lqi;
     return (int)bridge_build_frame(BRIDGE_EVT_RX_PACKET, payload, (size_t)n + 2u,
                                    out, out_len);
+}
+
+void usb_cdc_bridge_tick(void)
+{
+    extern UART_HandleTypeDef huart2;
+    
+    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE) || __HAL_UART_GET_FLAG(&huart2, UART_FLAG_NE)) {
+        __HAL_UART_CLEAR_OREFLAG(&huart2);
+        volatile uint32_t tmpr = huart2.Instance->DR; 
+        (void)tmpr;
+    }
+    while (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_RXNE)) {
+        uint8_t c = (uint8_t)(huart2.Instance->DR & 0xFF);
+        rx_buf[rx_idx++] = c;
+        if (rx_idx >= 128) rx_idx = 0;
+    }
+    
+    if (rx_idx >= 5) {
+        int start = -1;
+        for (int i = 0; i < rx_idx; i++) {
+            if (rx_buf[i] == 0xA5) {
+                start = i;
+                break;
+            }
+        }
+        if (start >= 0) {
+            if (start > 0) {
+                memmove(rx_buf, rx_buf + start, rx_idx - start);
+                rx_idx -= start;
+            }
+            if (rx_idx >= 3) {
+                int expected_len = rx_buf[2] + 5; 
+                if (rx_idx >= expected_len) {
+                    uint8_t response[128];
+                    int resp_len = usb_cdc_bridge_parse(rx_buf, expected_len, response, sizeof(response));
+                    if (resp_len > 0) {
+                        HAL_UART_Transmit(&huart2, response, (uint16_t)resp_len, 100);
+                    }
+                    memmove(rx_buf, rx_buf + expected_len, rx_idx - expected_len);
+                    rx_idx -= expected_len;
+                }
+            }
+        } else {
+            rx_idx = 0;
+        }
+    }
+    
+    uint8_t tx_buf[128];
+    int tx_len = usb_cdc_bridge_poll_radio(tx_buf, sizeof(tx_buf));
+    if (tx_len > 0) {
+        HAL_UART_Transmit(&huart2, tx_buf, (uint16_t)tx_len, 100); 
+    }
 }
