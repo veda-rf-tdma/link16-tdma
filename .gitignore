@@ -7,3 +7,5 @@ analysis_out/
 archive_data/
 analysis/legacy/
 stm32_bridge/anchor_project/
+logs/
+build/logs/

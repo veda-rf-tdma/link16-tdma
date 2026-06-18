@@ -6,6 +6,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <conio.h>
+#include <direct.h> // for _mkdir
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
 #endif
 #include "config.h"
 #include "protocol.h"
@@ -47,6 +51,27 @@ static void enable_ansi_support(void) {
     if (!GetConsoleMode(hOut, &dwMode)) return;
     dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     SetConsoleMode(hOut, dwMode);
+
+    // Set console buffer and window size to 85 columns x 35 lines
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
+        short w_width = 85;
+        short w_height = 35;
+
+        // Ensure buffer size is at least as large as the window size
+        COORD new_buf_size;
+        new_buf_size.X = (csbi.dwSize.X > w_width) ? csbi.dwSize.X : w_width;
+        new_buf_size.Y = (csbi.dwSize.Y > w_height) ? csbi.dwSize.Y : w_height;
+        SetConsoleScreenBufferSize(hOut, new_buf_size);
+
+        // Resize the window
+        SMALL_RECT rect;
+        rect.Left = 0;
+        rect.Top = 0;
+        rect.Right = w_width - 1;
+        rect.Bottom = w_height - 1;
+        SetConsoleWindowInfo(hOut, TRUE, &rect);
+    }
 }
 #endif
 
@@ -141,7 +166,7 @@ static void draw_dashboard(uint16_t frame_no, const char *port, const char *log_
     printf("======================================================================\n");
     printf("                  TDMA RADIO MASTER SYSTEM MONITOR                    \n");
     printf("======================================================================\n");
-    printf(" Port: %-8s | Frame No: %-6u | Log: %s\033[K\n", port, frame_no, log_path);
+    printf(" Port: %-8s | Frame No: %-6u | Log: %.35s\033[K\n", port, frame_no, log_path);
     printf("======================================================================\n\n");
 
     printf(" [NODE STATUS]\n");
@@ -177,7 +202,7 @@ static void draw_dashboard(uint16_t frame_no, const char *port, const char *log_
     printf(" [RECENT LOG EVENTS]\n");
     for (int i = 0; i < EVENT_LOG_SIZE; i++) {
         if (i < event_log_count) {
-            printf("  > %s\033[K\n", event_logs[i]);
+            printf("  > %.74s\033[K\n", event_logs[i]);
         } else {
             printf("  > \033[K\n");
         }
@@ -413,8 +438,8 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
             desktop_tuner_rx_packets++;
             tdma_aircraft_data_payload_t air_data;
             if (tdma_decode_aircraft_data(pkt.payload, pkt.payload_len, &air_data) == 0) {
-                printf("[ECHO] Received coordinate feedback from aircraft: X=%d cm, Y=%d cm\n",
-                       air_data.echoed_x_cm, air_data.echoed_y_cm);
+                add_event_log("[ECHO] Aircraft FB: X=%d Y=%d",
+                              air_data.echoed_x_cm, air_data.echoed_y_cm);
             }
             /* Cache direct measurement from aircraft */
             desktop_master_last_rssi = rssi;
@@ -430,17 +455,8 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
                     desktop_anchor2_has_rssi = 1;
                 }
                 if (report.has_relayed_data) {
-                    printf("[RELAY] Received aircraft coordinates relayed by Anchor 0x%02x: X=%d cm, Y=%d cm\n",
-                           pkt.src, report.relayed_data.echoed_x_cm, report.relayed_data.echoed_y_cm);
-                }
-            }
-        }
-        if (pkt.type == TDMA_PKT_ANCHOR_REPORT) {
-            tdma_anchor_report_payload_t report;
-            if (tdma_decode_anchor_report(pkt.payload, pkt.payload_len, &report) == 0) {
-                if (report.has_relayed_data) {
-                    printf("[RELAY] Received aircraft coordinates relayed by Anchor 0x%02x: X=%d cm, Y=%d cm\n",
-                           pkt.src, report.relayed_data.echoed_x_cm, report.relayed_data.echoed_y_cm);
+                    add_event_log("[RELAY] Anchor 0x%02x: X=%d Y=%d",
+                                  pkt.src, report.relayed_data.echoed_x_cm, report.relayed_data.echoed_y_cm);
                 }
             }
         }
@@ -657,7 +673,27 @@ int main(int argc, char **argv)
 #endif
 
     unsigned long frame_count = (argc > 2) ? strtoul(argv[2], 0, 10) : 0; // default to 0 (infinite)
-    const char *log_path = (argc > 3) ? argv[3] : "desktop_master_log.csv";
+    char log_path_buf[128];
+    const char *log_path = log_path_buf;
+    if (argc > 3) {
+        log_path = argv[3];
+    } else {
+        // Create logs directory if it doesn't exist
+#ifdef _WIN32
+        _mkdir("logs");
+#else
+        mkdir("logs", 0777);
+#endif
+
+        time_t t = time(NULL);
+        struct tm tm_now;
+#ifdef _WIN32
+        localtime_s(&tm_now, &t);
+#else
+        localtime_r(&t, &tm_now);
+#endif
+        strftime(log_path_buf, sizeof(log_path_buf), "logs/desktop_master_log_%Y%m%d_%H%M%S.csv", &tm_now);
+    }
     stm32_bridge_link_t bridge;
     FILE *log = fopen(log_path, "a");
 
@@ -681,8 +717,20 @@ int main(int argc, char **argv)
         fprintf(log, "timestamp,event,frame,receiver_id,receiver_role,tx_node_id,tx_role,slot_no,slot_role,channel,rssi_raw,rssi_dbm,lqi,detail\n");
     }
 
-    if (bridge_start_rx(&bridge) != 0) {
-        fprintf(stderr, "failed to start STM32 bridge RX\n");
+    int rx_rc = bridge_start_rx(&bridge);
+    if (rx_rc != 0) {
+        fprintf(stderr, "failed to start STM32 bridge RX (rc=%d)\n", rx_rc);
+        if (rx_rc == -2) {
+            fprintf(stderr, "\n======================================================================\n");
+            fprintf(stderr, "ERROR: Handshake Timeout! No response from Master Bridge.\n");
+            fprintf(stderr, "----------------------------------------------------------------------\n");
+            fprintf(stderr, "This usually means:\n");
+            fprintf(stderr, "  1. You selected the wrong COM port (%s).\n", port);
+            fprintf(stderr, "  2. The board on %s is a Node (Anchor/Aircraft) board, NOT the Master.\n", port);
+            fprintf(stderr, "  3. The Master board is not running the 'usb_cdc_bridge' firmware.\n");
+            fprintf(stderr, "Please verify your COM port and firmware, and try again.\n");
+            fprintf(stderr, "======================================================================\n\n");
+        }
         bridge_close(&bridge);
         if (log) {
             fclose(log);
@@ -690,11 +738,17 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    printf("[INFO] Handshake successful! Starting Master System Monitor...\n\n");
+    Sleep(1500);
+
 #ifdef _WIN32
     enable_ansi_support();
 #endif
-    // Clear screen once at startup
-    printf("\033[2J\033[H");
+    // Trigger terminal window resize via ANSI escape sequence (35 lines, 85 cols)
+    printf("\033[8;35;85t");
+    // Clear screen and scrollback buffer once at startup
+    printf("\033[2J\033[3J\033[H");
+    fflush(stdout);
 
     for (unsigned long i = 0; (frame_count == 0) || (i < frame_count); i++) {
         uint16_t frame_no = (uint16_t)i;
