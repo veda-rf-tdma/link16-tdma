@@ -23,10 +23,33 @@ void tdma_clock_sync_beacon(tdma_clock_t *clock, uint16_t frame_no, int64_t beac
         return;
     }
 
-    int64_t expected = clock->frame_start_local_us + (int64_t)clock->frame_period_us;
+    int16_t frames_diff = (int16_t)(frame_no - clock->frame_no);
+    
+    /* If the difference is negative or extremely large, it's likely a Master reset or a huge gap.
+     * Force a hard resynchronization. */
+    if (frames_diff < 0 || frames_diff > 100) {
+        clock->frame_start_local_us = beacon_rx_us;
+        clock->sync_offset_us = 0;
+        clock->frame_no = frame_no;
+        return;
+    }
+
+    if (frames_diff == 0) {
+        /* Duplicate beacon in the same frame, ignore */
+        return;
+    }
+
+    int64_t expected = clock->frame_start_local_us + (int64_t)frames_diff * (int64_t)clock->frame_period_us;
     int64_t error = beacon_rx_us - expected;
-    clock->sync_offset_us += error / 8;
-    clock->frame_start_local_us = beacon_rx_us - clock->sync_offset_us;
+    
+    /* If the clock drift is too large (>50ms) due to missed beacons, hard-sync instead of soft-tuning */
+    if (error > 50000 || error < -50000) {
+        clock->frame_start_local_us = beacon_rx_us;
+        clock->sync_offset_us = 0;
+    } else {
+        clock->sync_offset_us += error / 8;
+        clock->frame_start_local_us = beacon_rx_us - clock->sync_offset_us;
+    }
     clock->frame_no = frame_no;
 }
 
@@ -40,6 +63,9 @@ uint8_t tdma_slot_at(const tdma_clock_t *clock, int64_t now_us)
     if (!clock->locked || now_us < clock->frame_start_local_us) {
         return 0xffu;
     }
+    if (clock->frame_period_us == 0 || clock->slot_us == 0) {
+        return 0xffu;
+    }
     int64_t elapsed = (now_us - clock->frame_start_local_us) % clock->frame_period_us;
     return (uint8_t)(elapsed / clock->slot_us);
 }
@@ -47,6 +73,9 @@ uint8_t tdma_slot_at(const tdma_clock_t *clock, int64_t now_us)
 int tdma_is_inside_guard(const tdma_clock_t *clock, int64_t now_us)
 {
     if (!clock->locked || now_us < clock->frame_start_local_us) {
+        return 1;
+    }
+    if (clock->frame_period_us == 0 || clock->slot_us == 0) {
         return 1;
     }
     int64_t elapsed = (now_us - clock->frame_start_local_us) % clock->frame_period_us;

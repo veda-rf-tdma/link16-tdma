@@ -4,8 +4,12 @@
 #include "config.h"
 #include "protocol.h"
 #include "radio_metrics.h"
+#if defined(NODE_ROLE_MASTER)
 #include "ekf.h"
+#endif
+#if defined(NODE_ROLE_MASTER)
 #include "usb_cdc_bridge.h"
+#endif
 #include "main.h"
 #include <string.h>
 #include <stdio.h>
@@ -23,6 +27,9 @@ extern I2C_HandleTypeDef hi2c1;
 #ifndef CC1101_GDO0_Pin
 #define CC1101_GDO0_Pin GPIO_PIN_0
 #endif
+#ifndef CC1101_GDO0_GPIO_Port
+#define CC1101_GDO0_GPIO_Port GPIOB
+#endif
 
 #ifndef __HAL_TIM_GET_COUNTER
 #define __HAL_TIM_GET_COUNTER(__HANDLE__) ((__HANDLE__)->Instance->CNT)
@@ -31,7 +38,9 @@ extern I2C_HandleTypeDef hi2c1;
 static cc1101_t radio;
 static tdma_clock_t tdma_clock;
 static tdma_runtime_t tdma_runtime;
+#if defined(NODE_ROLE_MASTER)
 static ekf_t ekf_inst;
+#endif
 
 /* Dynamic frame period tuner variables (used on Master node) */
 typedef enum {
@@ -103,6 +112,7 @@ static void log_telemetry(const char *msg)
     HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)strlen(msg), 100);
 }
 
+#if defined(NODE_ROLE_MASTER)
 /**
  * @brief Converts RSSI dBm to linear power scale for Apollonius calculation.
  */
@@ -162,6 +172,7 @@ static void run_master_ekf_cycle(void)
     anchor_1_report_received = 0;
     anchor_2_report_received = 0;
 }
+#endif
 
 /**
  * @brief Handles packet reception, decodes the TDMA payload, 
@@ -178,14 +189,39 @@ static void process_received_packet(void)
         return;
     }
     
+    double rssi_dbm = cc1101_rssi_dbm(rssi_raw);
+    
+    /* If the clock is not locked yet (fallback mode), print detailed reception logs to check anchor status */
+    if (!tdma_clock.locked) {
+        char log_buf[256];
+        int offset = snprintf(log_buf, sizeof(log_buf), "UNLOCKED_RX: Len=%d, RSSI=%d, LQI=%u | Hex:", len, (int)rssi_dbm, lqi_raw);
+        for (int i = 0; i < len && offset < (int)sizeof(log_buf) - 10; i++) {
+            offset += snprintf(log_buf + offset, sizeof(log_buf) - offset, " %02X", rx_buf[i]);
+        }
+        snprintf(log_buf + offset, sizeof(log_buf) - offset, "\r\n");
+        log_telemetry(log_buf);
+    }
+    
     /* rx_buf[0] is the CC1101 destination address byte. Actual payload starts at rx_buf[1]. */
     tdma_packet_t packet;
     int rc = tdma_decode_payload(rx_buf + 1, (size_t)(len - 1), &packet);
     if (rc != 0) {
+        if (!tdma_clock.locked) {
+            char log_buf[64];
+            snprintf(log_buf, sizeof(log_buf), "UNLOCKED_RX: Decode Fail, rc=%d\r\n", rc);
+            log_telemetry(log_buf);
+        }
         return;
     }
     
-    double rssi_dbm = cc1101_rssi_dbm(rssi_raw);
+    if (!tdma_clock.locked) {
+        char log_buf[128];
+        snprintf(log_buf, sizeof(log_buf), "UNLOCKED_RX: Decoded OK! Type=%u, Src=0x%02X, Dst=0x%02X, Frame=%u\r\n",
+                 packet.type, packet.src, packet.dst, packet.frame_no);
+        log_telemetry(log_buf);
+    }
+    
+    /* rssi_dbm is already calculated above */
 
     /* --- Node Specific RX Handlers --- */
     
@@ -272,7 +308,11 @@ static void process_received_packet(void)
              tdma_runtime.local_node_id == TDMA_ANCHOR_2_ADDR) {
         if (packet.type == TDMA_PKT_BEACON) {
             /* Synchronize local clock */
-            tdma_clock_sync_beacon(&tdma_clock, packet.frame_no, (int64_t)get_monotonic_us());
+            uint8_t was_locked = tdma_clock.locked;
+            tdma_clock_sync_beacon(&tdma_clock, packet.frame_no, (int64_t)get_monotonic_us() - TDMA_BEACON_SYNC_DELAY_US);
+            if (!was_locked) {
+                log_telemetry("INFO: Beacon received! Clock LOCKED successfully.\r\n");
+            }
             
             /* Extract frame period and slot width configurations */
             tdma_beacon_payload_t beacon_payload;
@@ -309,7 +349,11 @@ static void process_received_packet(void)
     else if (tdma_runtime.local_node_id == TDMA_AIRCRAFT_ADDR) {
         if (packet.type == TDMA_PKT_BEACON) {
             /* Synchronize local clock */
-            tdma_clock_sync_beacon(&tdma_clock, packet.frame_no, (int64_t)get_monotonic_us());
+            uint8_t was_locked = tdma_clock.locked;
+            tdma_clock_sync_beacon(&tdma_clock, packet.frame_no, (int64_t)get_monotonic_us() - TDMA_BEACON_SYNC_DELAY_US);
+            if (!was_locked) {
+                log_telemetry("INFO: Beacon received! Clock LOCKED successfully.\r\n");
+            }
   
             /* Extract feedback coordinates sent from Master beacon */
             tdma_beacon_payload_t beacon_payload;
@@ -415,6 +459,7 @@ static void transmit_slot_packet(void)
         return;
     }
     
+    packet.payload_len = (uint8_t)payload_len;
     size_t tx_payload_len = tdma_encode_payload(&packet, tdma_payload, sizeof(tdma_payload));
     if (tx_payload_len == 0) {
         return;
@@ -423,6 +468,16 @@ static void transmit_slot_packet(void)
     size_t tx_len = cc1101_wrap_variable_packet(0x00, tdma_payload, tx_payload_len, tx_buf, sizeof(tx_buf));
     if (tx_len > 0) {
         cc1101_send_packet(&radio, tx_buf, tx_len);
+        
+        /* Print debug log only for the very first transmission to prevent slot timing disruption */
+        static int first_tx_logged = 0;
+        if (!first_tx_logged) {
+            first_tx_logged = 1;
+            char tx_log[128];
+            snprintf(tx_log, sizeof(tx_log), "INFO: First TDMA TX packet sent! Type=%u, Src=0x%02X, Slot=%u, Len=%u\r\n",
+                     packet.type, packet.src, packet.slot_no, (unsigned int)tx_len);
+            log_telemetry(tx_log);
+        }
     }
 }
 
@@ -485,8 +540,18 @@ static void run_hardware_diagnostics(void)
  */
 void tdma_app_init(void)
 {
+    /* Start TIM2 32-bit hardware timer */
+    HAL_TIM_Base_Start(&htim2);
+
     /* 1. Ensure CC1101 CSN is high initially */
     cc1101_platform_deselect();
+    
+    /* Override GDO0 EXTI trigger to falling edge only to prevent rising-edge double trigger */
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GDO0_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GDO0_GPIO_Port, &GPIO_InitStruct);
     
     /* Run connection check and diagnostic logs first */
     run_hardware_diagnostics();
@@ -520,7 +585,9 @@ void tdma_app_init(void)
         tdma_clock.frame_start_local_us = (int64_t)get_monotonic_us();
         
         /* Initialize Master's EKF tracking state */
+#if defined(NODE_ROLE_MASTER)
         ekf_init(&ekf_inst, 2.5, 2.165);
+#endif
     }
 
     /* Turn ON user LED PA8 initially on Anchor nodes to signal active status */
@@ -529,7 +596,16 @@ void tdma_app_init(void)
         HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
     }
     
-    log_telemetry("INFO: TDMA runtime initialized\r\n");
+    /* Put the radio in RX mode initially to listen for the synchronization beacon */
+    if (tdma_runtime.local_node_id != TDMA_MASTER_ADDR) {
+        cc1101_set_channel(&radio, FHSS_CHANNEL_BASE);
+        cc1101_start_rx(&radio);
+        log_telemetry("INFO: Radio started in RX mode on beacon channel\r\n");
+    }
+    
+    char init_msg[64];
+    snprintf(init_msg, sizeof(init_msg), "INFO: TDMA runtime initialized (Node ID: 0x%02X)\r\n", tdma_runtime.local_node_id);
+    log_telemetry(init_msg);
 }
 
 /**
@@ -560,7 +636,77 @@ void tdma_app_tick(void)
         last_btn_state = btn_state;
     }
 
+#if defined(RF_RAW_TEST_MODE) && (RF_RAW_TEST_MODE == 1u)
+    /* Pure Hardware Receiver Polling Test Mode */
+    uint8_t rx_buf[96];
+    uint8_t rssi_raw = 0;
+    uint8_t lqi_raw = 0;
+    
+    /* Periodically ensure radio is in RX mode on channel 5 */
+    static uint32_t last_rx_init_ms = 0;
+    uint32_t now_ms = HAL_GetTick();
+    if (now_ms - last_rx_init_ms >= 1000) {
+        last_rx_init_ms = now_ms;
+        cc1101_set_channel(&radio, FHSS_CHANNEL_BASE);
+        cc1101_start_rx(&radio);
+    }
+    
+    int len = 0;
+    if (HAL_GPIO_ReadPin(CC1101_GDO0_GPIO_Port, CC1101_GDO0_Pin) == GPIO_PIN_RESET) {
+        len = cc1101_poll_packet(&radio, rx_buf, sizeof(rx_buf), &rssi_raw, &lqi_raw);
+    }
+    if (len > 0) {
+        double rssi_dbm = cc1101_rssi_dbm(rssi_raw);
+        char log_buf[256];
+        int offset = snprintf(log_buf, sizeof(log_buf), "[RX OK] Len: %d | RSSI: %d dBm | LQI: %u | Hex:", len, (int)rssi_dbm, lqi_raw);
+        for (int i = 0; i < len && offset < (int)sizeof(log_buf) - 10; i++) {
+            offset += snprintf(log_buf + offset, sizeof(log_buf) - offset, " %02X", rx_buf[i]);
+        }
+        
+        /* Try to decode the packet as a TDMA packet */
+        tdma_packet_t packet;
+        int rc = tdma_decode_payload(rx_buf + 1, (size_t)(len - 1), &packet);
+        if (rc == 0) {
+            offset += snprintf(log_buf + offset, sizeof(log_buf) - offset, " | TDMA: Type=%u, Src=0x%02X, Dst=0x%02X, Frame=%u",
+                               packet.type, packet.src, packet.dst, packet.frame_no);
+            if (packet.type == TDMA_PKT_BEACON) {
+                tdma_beacon_payload_t beacon;
+                if (tdma_decode_beacon(packet.payload, packet.payload_len, &beacon) == 0) {
+                    offset += snprintf(log_buf + offset, sizeof(log_buf) - offset, " (Beacon: Period=%lu, X=%d, Y=%d)",
+                                       (unsigned long)beacon.frame_period_us, beacon.aircraft_x_cm, beacon.aircraft_y_cm);
+                }
+            }
+        } else {
+            offset += snprintf(log_buf + offset, sizeof(log_buf) - offset, " | Decode Err: %d", rc);
+        }
+        
+        snprintf(log_buf + offset, sizeof(log_buf) - offset, "\r\n");
+        log_telemetry(log_buf);
+        
+        /* Toggle LED to visually show receipt */
+        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_8);
+    }
+    return;
+#endif
+
     uint64_t now = get_monotonic_us();
+
+    /* Fallback beacon listening when local clock is not locked */
+    if (tdma_runtime.local_node_id != TDMA_MASTER_ADDR && !tdma_clock.locked) {
+        static uint64_t last_rx_strobe_us = 0;
+        /* Extend the strobe interval to 2 seconds (2000000us) to prevent collision with Master's 100ms beacon */
+        if (now - last_rx_strobe_us >= 2000000u) {
+            last_rx_strobe_us = now;
+            cc1101_set_channel(&radio, FHSS_CHANNEL_BASE);
+            cc1101_start_rx(&radio);
+        }
+        if (tdma_runtime.gdo0_pending) {
+            tdma_runtime.gdo0_pending = 0;
+            process_received_packet();
+        }
+        return;
+    }
+
     double current_margin_db = 12.0; /* default target margin */
     
     /* Tick state machine to determine Slot state */
@@ -668,7 +814,9 @@ void tdma_app_tick(void)
             uint8_t last_slot_in_frame = (uint8_t)(tdma_clock.frame_period_us / tdma_clock.slot_us) - 1;
             if (step.slot_no == last_slot_in_frame && step.slot_pos_us >= (tdma_clock.slot_us - tdma_clock.guard_us)) {
                 /* End of last slot (Guard interval). Run EKF cycle for next frame beacon */
+#if defined(NODE_ROLE_MASTER)
                 run_master_ekf_cycle();
+#endif
             }
         }
         break;

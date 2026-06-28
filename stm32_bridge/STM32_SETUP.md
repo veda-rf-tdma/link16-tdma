@@ -81,11 +81,13 @@
 ```powershell
 python stm32_bridge/pack_stm32.py
 ```
-실행 완료 시, `stm32_bridge/Inc` 폴더와 `stm32_bridge/Src` 폴더 내에 EKF 알고리즘, TDMA 시간 동기화, CC1101 프리셋 등을 포함한 **모든 필요한 소스 및 헤더 파일이 자동으로 수집**됩니다.
+실행 완료 시, `stm32_bridge/Inc` 폴더와 `stm32_bridge/Src` 폴더 내에 EKF 알고리즘, TDMA 시간 동기화, CC1101 프리셋 등을 포함한 **모든 필요한 소스 및 헤더 파일이 자동으로 수집**됩니다. 
+또한 시스템에 Keil 프로젝트 경로(`C:\Users\devSh\Documents\link16\link16-node`)가 존재할 경우, **해당 Keil 프로젝트의 `Core/Inc` 및 `Core/Src` 폴더로 자동 동기화(Copy)가 수행**되므로 수동 복사가 필요 없습니다.
 
-### 2) 드래그 앤 드롭 파일 복사
-* 생성된 `stm32_bridge/Inc` 폴더의 모든 헤더 파일들을 STM32 프로젝트의 **`Core/Inc`** 폴더에 넣습니다.
-* 생성된 `stm32_bridge/Src` 폴더의 모든 소스 파일들을 STM32 프로젝트의 **`Core/Src`** 폴더에 넣습니다.
+### 2) 드래그 앤 드롭 파일 복사 (수동 동기화 필요 시)
+* 스크립트 자동 동기화 대상 외의 경로에 프로젝트가 있거나 수동 동기화가 필요한 경우:
+  * 생성된 `stm32_bridge/Inc` 폴더의 모든 헤더 파일들을 STM32 프로젝트의 **`Core/Inc`** 폴더에 넣습니다.
+  * 생성된 `stm32_bridge/Src` 폴더의 모든 소스 파일들을 STM32 프로젝트의 **`Core/Src`** 폴더에 넣습니다.
 
 ---
 
@@ -174,5 +176,5 @@ Keil uVision 평가판(Evaluation/Lite Edition)의 32KB 코드 크기 제한 에
 | 빌드 대상 (Keil Define 매크로) | 빌드에서 제외할 파일 목록 (Exclude 대상 C 파일) |
 | :--- | :--- |
 | **마스터 브릿지 보드**<br>(`NODE_ROLE_MASTER`) | - `tdma_app.c`<br>- `ekf.c`<br>- `tdma.c`<br>- `tdma_runtime.c`<br>- `node_table.c`<br>- `radio_metrics.c` |
-| **비행체 및 앵커 노드 보드**<br>(`NODE_ROLE_AIRCRAFT` 등) | - `usb_cdc_bridge.c`<br>- **ST USB 라이브러리 관련 파일 일체** (`usb_device.c`, `usbd_cdc_if.c`, `usbd_conf.c`, `usbd_cdc.c`, `usbd_core.c`, `usbd_ctlreq.c`, `usbd_ioreq.c` 등) |
+| **비행체 및 앵커 노드 보드**<br>(`NODE_ROLE_AIRCRAFT` 등) | - `usb_cdc_bridge.c`<br>- `ekf.c` (마스터 전용 EKF 알고리즘으로, 비행체/앵커 빌드 시 불필요하여 제외 권장)<br>- `node_table.c` (공용 미사용 소스로, 빌드 시 제외 권장)<br>- **ST USB 라이브러리 관련 파일 일체** (`usb_device.c`, `usbd_cdc_if.c`, `usbd_conf.c`, `usbd_cdc.c`, `usbd_core.c`, `usbd_ctlreq.c`, `usbd_ioreq.c` 등) |
 

@@ -83,6 +83,10 @@ static int runtime_time(const tdma_clock_t *clock, int64_t now_us,
         return 0;
     }
 
+    if (clock->frame_period_us == 0 || clock->slot_us == 0) {
+        return 0;
+    }
+
     int64_t elapsed = now_us - clock->frame_start_local_us;
     uint32_t frames_elapsed = (uint32_t)(elapsed / (int64_t)clock->frame_period_us);
     uint32_t frame_pos = (uint32_t)(elapsed % (int64_t)clock->frame_period_us);
@@ -165,7 +169,20 @@ tdma_runtime_step_t tdma_runtime_tick(tdma_runtime_t *runtime,
     if (!runtime->radio_started) {
         runtime->radio_started = 1;
         if (runtime->plan.slot_role == TDMA_SLOT_JOIN_ROLE) {
+            int should_join = 0;
             if (runtime->local_node_id == TDMA_ADDR_UNASSIGNED) {
+                should_join = 1;
+            } else if (runtime->local_node_id == TDMA_ANCHOR_1_ADDR) {
+                if (clock && !(clock->active_mask & (1 << 2))) {
+                    should_join = 1;
+                }
+            } else if (runtime->local_node_id == TDMA_ANCHOR_2_ADDR) {
+                if (clock && !(clock->active_mask & (1 << 3))) {
+                    should_join = 1;
+                }
+            }
+
+            if (should_join) {
                 runtime->state = TDMA_RUNTIME_TX_ACTIVE;
                 return make_step(runtime, TDMA_ACTION_START_TX, slot_pos_us);
             } else if (runtime->local_node_id == TDMA_MASTER_ADDR) {

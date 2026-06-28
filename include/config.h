@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#define RF_RAW_TEST_MODE      0u    /* 1u = Enable pure hardware polling RF test mode, 0u = Normal TDMA mode */
+
 #define TDMA_NETWORK_ID       0x16u
 #define TDMA_FRAME_PERIOD_US  100000u
 #define TDMA_SLOT_US          10000u
@@ -37,7 +39,7 @@
 #define TDMA_ANCHOR_GRACE_PERIOD_FRAMES     300u
 
 #define FHSS_CHANNEL_BASE     5u
-#define FHSS_CHANNEL_COUNT    16u
+#define FHSS_CHANNEL_COUNT    1u
 #define FHSS_LCG_A            17u
 #define FHSS_LCG_C            43u
 
@@ -52,8 +54,9 @@
 
 #define STM32_CC1101_SPI_HZ   6500000u
 #define CC1101_CARRIER_MHZ    433.919830
-#define CC1101_TX_POWER_DBM   5.0
+#define CC1101_TX_POWER_DBM   0.0
 #define CC1101_RSSI_OFFSET_DB 74.0
 #define RADIO_PATH_LOSS_EXPONENT 2.0
+#define TDMA_BEACON_SYNC_DELAY_US 14000u /* Compensation for serial + RF propagation delay (14ms) */
 
 #endif
