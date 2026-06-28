@@ -209,56 +209,118 @@ int bridge_poll_packet(stm32_bridge_link_t *link, uint8_t *data, size_t max_len)
 int bridge_poll_packet_meta(stm32_bridge_link_t *link, uint8_t *data, size_t max_len,
                             uint8_t *rssi, uint8_t *lqi)
 {
-    uint8_t hdr[3];
-    int n = serial_win_read(&link->serial, hdr, sizeof(hdr));
-    if (n <= 0) {
-        return 0;
-    }
-    if (n != 3 || hdr[0] != BRIDGE_MAGIC || hdr[1] != BRIDGE_EVT_RX_PACKET) {
-        return -1;
-    }
-    if (hdr[2] < 2) {
-        return -2;
-    }
-    uint8_t radio_len = (uint8_t)(hdr[2] - 2u);
-    if (radio_len > max_len) {
-        return -2;
+    static uint8_t rx_buf[1024];
+    static size_t rx_idx = 0;
+
+    // 1. Read all available bytes from serial port
+    uint8_t temp[256];
+    int n = serial_win_read(&link->serial, temp, sizeof(temp));
+    if (n > 0) {
+        if (rx_idx + (size_t)n <= sizeof(rx_buf)) {
+            memcpy(rx_buf + rx_idx, temp, (size_t)n);
+            rx_idx += (size_t)n;
+        } else {
+            // Buffer overflow safety: discard buffer and start fresh
+            rx_idx = 0;
+        }
     }
 
-    uint8_t payload[BRIDGE_MAX_FRAME];
-    int payload_n = serial_win_read(&link->serial, payload, hdr[2]);
-    uint8_t crc_bytes[2];
-    int crc_n = serial_win_read(&link->serial, crc_bytes, sizeof(crc_bytes));
-    if (payload_n != hdr[2] || crc_n != 2) {
-        return -3;
+    // 2. Process buffer to find valid frames
+    while (rx_idx >= 5) {
+        int start = -1;
+        for (size_t i = 0; i < rx_idx; i++) {
+            if (rx_buf[i] == BRIDGE_MAGIC) {
+                start = (int)i;
+                break;
+            }
+        }
+
+        // If no Magic byte is found, discard all bytes
+        if (start < 0) {
+            rx_idx = 0;
+            break;
+        }
+
+        // Shift buffer to align start with BRIDGE_MAGIC
+        if (start > 0) {
+            memmove(rx_buf, rx_buf + start, rx_idx - (size_t)start);
+            rx_idx -= (size_t)start;
+        }
+
+        // Sane check headers
+        uint8_t type = rx_buf[1];
+        uint8_t payload_len = rx_buf[2];
+        size_t expected_len = (size_t)payload_len + 5u;
+
+        if (type != BRIDGE_EVT_RX_PACKET && type != BRIDGE_EVT_TX_DONE && type != BRIDGE_EVT_ERROR) {
+            // False start Magic byte, shift by 1 and retry
+            memmove(rx_buf, rx_buf + 1, rx_idx - 1);
+            rx_idx -= 1;
+            continue;
+        }
+
+        if (expected_len > 128) {
+            // False start Magic byte due to invalid length, shift by 1 and retry
+            memmove(rx_buf, rx_buf + 1, rx_idx - 1);
+            rx_idx -= 1;
+            continue;
+        }
+
+        // If the complete frame is not yet received, wait for next poll
+        if (rx_idx < expected_len) {
+            break;
+        }
+
+        // Verify CRC
+        uint16_t expected_crc = (uint16_t)(((uint16_t)rx_buf[expected_len - 2] << 8) | rx_buf[expected_len - 1]);
+        uint16_t actual_crc = tdma_crc16_ccitt(rx_buf, expected_len - 2);
+
+        if (expected_crc != actual_crc) {
+            // CRC mismatch, shift by 1 and retry
+            memmove(rx_buf, rx_buf + 1, rx_idx - 1);
+            rx_idx -= 1;
+            continue;
+        }
+
+        // Valid frame parsed!
+        if (type == BRIDGE_EVT_RX_PACKET) {
+            if (payload_len < 2) {
+                memmove(rx_buf, rx_buf + expected_len, rx_idx - expected_len);
+                rx_idx -= expected_len;
+                return -2;
+            }
+            uint8_t radio_len = (uint8_t)(payload_len - 2u);
+            if (radio_len > max_len) {
+                memmove(rx_buf, rx_buf + expected_len, rx_idx - expected_len);
+                rx_idx -= expected_len;
+                return -2;
+            }
+
+            for (size_t i = 0; i < radio_len; i++) {
+                data[i] = rx_buf[3 + i];
+            }
+            if (rssi) {
+                *rssi = rx_buf[3 + radio_len];
+            }
+            if (lqi) {
+                *lqi = rx_buf[3 + radio_len + 1u];
+            }
+
+            memmove(rx_buf, rx_buf + expected_len, rx_idx - expected_len);
+            rx_idx -= expected_len;
+            return (int)radio_len;
+        } else {
+            // Consume non-RX events (like TX_DONE, ERROR) and continue parsing
+            if (type == BRIDGE_EVT_ERROR && payload_len >= 1) {
+                fprintf(stderr, "\n[ERROR] Master Bridge Error Event: code 0x%02X\n", rx_buf[3]);
+            }
+            memmove(rx_buf, rx_buf + expected_len, rx_idx - expected_len);
+            rx_idx -= expected_len;
+            continue;
+        }
     }
 
-    uint8_t check[BRIDGE_MAX_FRAME];
-    if ((size_t)hdr[2] + 3u > sizeof(check)) {
-        return -4;
-    }
-    check[0] = hdr[0];
-    check[1] = hdr[1];
-    check[2] = hdr[2];
-    for (uint8_t i = 0; i < hdr[2]; i++) {
-        check[3 + i] = payload[i];
-    }
-
-    uint16_t expected = (uint16_t)(((uint16_t)crc_bytes[0] << 8) | crc_bytes[1]);
-    uint16_t actual = tdma_crc16_ccitt(check, (size_t)hdr[2] + 3u);
-    if (expected != actual) {
-        return -5;
-    }
-    for (uint8_t i = 0; i < radio_len; i++) {
-        data[i] = payload[i];
-    }
-    if (rssi) {
-        *rssi = payload[radio_len];
-    }
-    if (lqi) {
-        *lqi = payload[radio_len + 1u];
-    }
-    return radio_len;
+    return 0;
 }
 
 void bridge_close(stm32_bridge_link_t *link)

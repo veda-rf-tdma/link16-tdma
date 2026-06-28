@@ -31,9 +31,9 @@ int serial_win_open(serial_win_t *serial, const char *port_name, uint32_t baud)
 
     COMMTIMEOUTS timeouts;
     SecureZeroMemory(&timeouts, sizeof(timeouts));
-    timeouts.ReadIntervalTimeout = 20;
-    timeouts.ReadTotalTimeoutConstant = 20;
-    timeouts.ReadTotalTimeoutMultiplier = 2;
+    timeouts.ReadIntervalTimeout = 5;
+    timeouts.ReadTotalTimeoutConstant = 5;
+    timeouts.ReadTotalTimeoutMultiplier = 0;
     timeouts.WriteTotalTimeoutConstant = 100;
     timeouts.WriteTotalTimeoutMultiplier = 2;
     SetCommTimeouts(serial->handle, &timeouts);

@@ -52,11 +52,11 @@ static void enable_ansi_support(void) {
     dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     SetConsoleMode(hOut, dwMode);
 
-    // Set console buffer and window size to 85 columns x 35 lines
+    // Set console buffer and window size to 85 columns x 38 lines
     CONSOLE_SCREEN_BUFFER_INFO csbi;
     if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
         short w_width = 85;
-        short w_height = 35;
+        short w_height = 38;
 
         // Ensure buffer size is at least as large as the window size
         COORD new_buf_size;
@@ -188,6 +188,60 @@ static void draw_dashboard(uint16_t frame_no, const char *port, const char *log_
     printf("  - EKF Mode        : %s\033[K\n\n", 
            (current_desktop_mode == MODE_ACTIVE_TRACKING) ? "ACTIVE_TRACKING" : "LIVENESS_MONITOR");
 
+    printf(" [TDMA SLOT STATUS & ALLOCATIONS]\n");
+    uint32_t active_nodes_count = 0;
+    for (int b = 0; b < 8; b++) {
+        if (desktop_active_mask & (1 << b)) active_nodes_count++;
+    }
+    uint32_t total_slots = 0;
+    if (desktop_slot_us > 0) {
+        total_slots = desktop_frame_period_us / desktop_slot_us;
+    }
+    uint32_t used_slots = active_nodes_count + 1; // nodes + join slot
+    uint32_t unused_slots = (total_slots > used_slots) ? (total_slots - used_slots) : 0;
+    
+    char mask_bin[9];
+    for (int b = 0; b < 8; b++) {
+        mask_bin[7 - b] = (desktop_active_mask & (1 << b)) ? '1' : '0';
+    }
+    mask_bin[8] = '\0';
+    
+    printf("  - Active Mask     : 0x%02X (%s) | Active Nodes: %u\033[K\n", 
+           desktop_active_mask, mask_bin, active_nodes_count);
+    printf("  - Slot Usage      : Used: %u, Unused: %u (Total: %u slots)\033[K\n", 
+           used_slots, unused_slots, total_slots);
+    
+    printf("  - Slot Map        : ");
+    if (total_slots > 0) {
+        for (uint32_t s = 0; s < total_slots; s++) {
+            if (s == total_slots - 1) {
+                printf("|%u:JON", s);
+            } else {
+                uint8_t active_nodes[8];
+                int active_cnt = 0;
+                if (desktop_active_mask & (1 << 0)) active_nodes[active_cnt++] = TDMA_MASTER_ADDR;
+                if (desktop_active_mask & (1 << 1)) active_nodes[active_cnt++] = TDMA_AIRCRAFT_ADDR;
+                if (desktop_active_mask & (1 << 2)) active_nodes[active_cnt++] = TDMA_ANCHOR_1_ADDR;
+                if (desktop_active_mask & (1 << 3)) active_nodes[active_cnt++] = TDMA_ANCHOR_2_ADDR;
+                
+                if (s < (uint32_t)active_cnt) {
+                    uint8_t node_addr = active_nodes[s];
+                    const char *node_name = "???";
+                    if (node_addr == TDMA_MASTER_ADDR) node_name = "MST";
+                    else if (node_addr == TDMA_AIRCRAFT_ADDR) node_name = "AIR";
+                    else if (node_addr == TDMA_ANCHOR_1_ADDR) node_name = "AN1";
+                    else if (node_addr == TDMA_ANCHOR_2_ADDR) node_name = "AN2";
+                    printf("|%u:%s", s, node_name);
+                } else {
+                    printf("|%u:---", s);
+                }
+            }
+        }
+        printf("|\033[K\n\n");
+    } else {
+        printf("N/A\033[K\n\n");
+    }
+
     printf(" [EKF TARGET ESTIMATION (Apollonius Seq EKF)]\n");
     if (desktop_ekf_initialized) {
         double uncertainty = sqrt(desktop_ekf.P[0][0] + desktop_ekf.P[1][1]);
@@ -286,7 +340,7 @@ static int send_beacon(stm32_bridge_link_t *bridge, uint16_t frame_no)
     if (payload_len == 0) {
         return -1;
     }
-    size_t radio_len = cc1101_wrap_variable_packet(TDMA_ADDR_BROADCAST, payload,
+    size_t radio_len = cc1101_wrap_variable_packet(0x00, payload,
                                                    payload_len, cc1101_frame,
                                                    sizeof(cc1101_frame));
     if (radio_len == 0) {
@@ -310,18 +364,18 @@ static uint8_t allocate_address(tdma_node_table_t *table, uint8_t *slot_out)
     return 0;
 }
 
-static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t frame_no, tdma_node_table_t *table)
+static int poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t frame_no, tdma_node_table_t *table)
 {
     uint8_t radio_frame[100];
     uint8_t rssi = 0;
     uint8_t lqi = 0;
     int n = bridge_poll_packet_meta(bridge, radio_frame, sizeof(radio_frame), &rssi, &lqi);
     if (n <= 0) {
-        return;
+        return 0;
     }
     if (n < 2) {
         log_event(log, "RX_SHORT", frame_no, "radio frame too short");
-        return;
+        return 1;
     }
 
     tdma_packet_t pkt;
@@ -331,7 +385,7 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
         snprintf(detail, sizeof(detail), "addr=0x%02x bytes=%d decode=%d",
                  radio_frame[0], n, rc);
         log_event(log, "RX_BAD", frame_no, detail);
-        return;
+        return 1;
     }
 
     double rssi_dbm = cc1101_rssi_dbm(rssi);
@@ -415,7 +469,7 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
                 uint8_t tx_payload[96];
                 uint8_t tx_radio_frame[100];
                 size_t tx_payload_len = tdma_encode_payload(&accept_pkt, tx_payload, sizeof(tx_payload));
-                size_t tx_radio_len = cc1101_wrap_variable_packet(TDMA_ADDR_BROADCAST, tx_payload, tx_payload_len, tx_radio_frame, sizeof(tx_radio_frame));
+                size_t tx_radio_len = cc1101_wrap_variable_packet(0x00, tx_payload, tx_payload_len, tx_radio_frame, sizeof(tx_radio_frame));
 
                 int send_rc = bridge_send_packet(bridge, tx_radio_frame, tx_radio_len);
                 if (send_rc == 0) {
@@ -461,6 +515,7 @@ static void poll_and_log_rx(stm32_bridge_link_t *bridge, FILE *log, uint16_t fra
             }
         }
     }
+    return 1;
 }
 
 #define MAX_PROFILES 32
@@ -705,6 +760,22 @@ int main(int argc, char **argv)
         master_node->slot_no = TDMA_SLOT_MASTER_BEACON;
         master_node->state = TDMA_NODE_STATE_ACTIVE;
     }
+    // Pre-register static nodes (LOST state by default, active on receipt)
+    tdma_node_t *a1_node = node_table_upsert(&master_node_table, TDMA_ADDR_BASE_2);
+    if (a1_node) {
+        a1_node->slot_no = TDMA_SLOT_ANCHOR_1_REPORT;
+        a1_node->state = TDMA_NODE_STATE_LOST;
+    }
+    tdma_node_t *a2_node = node_table_upsert(&master_node_table, TDMA_ADDR_BASE_3);
+    if (a2_node) {
+        a2_node->slot_no = TDMA_SLOT_ANCHOR_2_REPORT;
+        a2_node->state = TDMA_NODE_STATE_LOST;
+    }
+    tdma_node_t *ac_node = node_table_upsert(&master_node_table, TDMA_ADDR_MOBILE_1);
+    if (ac_node) {
+        ac_node->slot_no = TDMA_SLOT_AIRCRAFT_TX;
+        ac_node->state = TDMA_NODE_STATE_LOST;
+    }
 
     if (bridge_open(&bridge, port) != 0) {
         fprintf(stderr, "failed to open STM32 bridge on %s\n", port);
@@ -744,14 +815,17 @@ int main(int argc, char **argv)
 #ifdef _WIN32
     enable_ansi_support();
 #endif
-    // Trigger terminal window resize via ANSI escape sequence (35 lines, 85 cols)
-    printf("\033[8;35;85t");
+    // Trigger terminal window resize via ANSI escape sequence (38 lines, 85 cols)
+    printf("\033[8;38;85t");
     // Clear screen and scrollback buffer once at startup
     printf("\033[2J\033[3J\033[H");
     fflush(stdout);
 
     for (unsigned long i = 0; (frame_count == 0) || (i < frame_count); i++) {
         uint16_t frame_no = (uint16_t)i;
+        #ifdef _WIN32
+        DWORD frame_start_tick = GetTickCount();
+        #endif
         
         // Tick timeouts for dynamic nodes
         node_table_tick_timeouts(&master_node_table);
@@ -936,13 +1010,21 @@ int main(int argc, char **argv)
             log_event(log, "TX_FAIL", frame_no, detail);
         }
 
-        unsigned long poll_sleep = (desktop_frame_period_us / 1000u) / 10u;
-        if (poll_sleep == 0) poll_sleep = 1;
-
-        for (int poll = 0; poll < 10; poll++) {
+        // Poll serial port continuously for the entire duration of the frame to capture slots in real-time
+        #ifdef _WIN32
+        DWORD target_ms = desktop_frame_period_us / 1000u;
+        while (GetTickCount() - frame_start_tick < target_ms) {
             poll_and_log_rx(&bridge, log, frame_no, &master_node_table);
-            sleep_ms(poll_sleep);
+            Sleep(2); // Prevent CPU pegging
         }
+        #else
+        uint64_t target_ms = desktop_frame_period_us / 1000u;
+        uint64_t start_ms = get_monotonic_us() / 1000;
+        while ((get_monotonic_us() / 1000) - start_ms < target_ms) {
+            poll_and_log_rx(&bridge, log, frame_no, &master_node_table);
+            sleep_ms(2);
+        }
+        #endif
 
         /* Run EKF cycle at the end of the frame */
         if (current_desktop_mode == MODE_ACTIVE_TRACKING) {
