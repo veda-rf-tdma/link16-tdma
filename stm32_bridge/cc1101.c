@@ -67,6 +67,19 @@ static int cc1101_read_status(cc1101_t *radio, uint8_t addr, uint8_t *value)
     return 0;
 }
 
+static int cc1101_read_reg(cc1101_t *radio, uint8_t addr, uint8_t *value)
+{
+    uint8_t tx[2] = {(uint8_t)(addr | CC1101_READ), 0};
+    uint8_t rx[2] = {0, 0};
+    (void)radio;
+    int rc = cc1101_transfer_selected(tx, rx, sizeof(tx));
+    if (rc < 0) {
+        return rc;
+    }
+    *value = rx[1];
+    return 0;
+}
+
 static int cc1101_read_burst(cc1101_t *radio, uint8_t addr, uint8_t *data, size_t len)
 {
     uint8_t tx[96];
@@ -127,6 +140,20 @@ int cc1101_start_rx(cc1101_t *radio)
     return cc1101_strobe(radio, CC1101_SRX);
 }
 
+int cc1101_rx_bytes_available(cc1101_t *radio)
+{
+    uint8_t rxbytes = 0;
+    int rc = cc1101_read_status(radio, CC1101_STATUS_RXBYTES, &rxbytes);
+    if (rc < 0) {
+        return rc;
+    }
+    if (rxbytes & 0x80u) {
+        // FIFO overflow
+        return -2;
+    }
+    return (int)(rxbytes & 0x7Fu);
+}
+
 int cc1101_send_packet(cc1101_t *radio, const uint8_t *data, size_t len)
 {
     if (!data || len == 0 || len > 64) {
@@ -139,7 +166,7 @@ int cc1101_send_packet(cc1101_t *radio, const uint8_t *data, size_t len)
         return rc;
     }
     rc = cc1101_strobe(radio, CC1101_STX);
-    cc1101_platform_delay_ms(100);
+    cc1101_platform_delay_ms(5);
     return rc;
 }
 
@@ -154,6 +181,7 @@ int cc1101_poll_packet(cc1101_t *radio, uint8_t *data, size_t max_len,
     if (rxbytes & 0x80u) {
         cc1101_strobe(radio, CC1101_SIDLE);
         cc1101_strobe(radio, CC1101_SFRX);
+        cc1101_strobe(radio, CC1101_SRX);
         return -2;
     }
     rxbytes &= 0x7fu;
@@ -161,31 +189,58 @@ int cc1101_poll_packet(cc1101_t *radio, uint8_t *data, size_t max_len,
         return 0;
     }
 
-    uint8_t length = 0;
-    rc = cc1101_read_burst(radio, CC1101_RXFIFO, &length, 1);
+    /* 
+     * To prevent SPI clock glitches and byte-shift issues caused by 
+     * multiple back-to-back HAL_SPI_TransmitReceive calls, we read the 
+     * entire RX FIFO in ONE single continuous SPI transaction.
+     */
+    uint8_t tx[96];
+    uint8_t rx[96];
+    if (rxbytes > sizeof(tx) - 1u) {
+        rxbytes = sizeof(tx) - 1u;
+    }
+
+    tx[0] = (uint8_t)(CC1101_RXFIFO | CC1101_READ | CC1101_BURST);
+    for (size_t i = 0; i < rxbytes; i++) {
+        tx[1 + i] = 0;
+    }
+
+    /* Perform a single SPI transaction */
+    cc1101_platform_select();
+    rc = cc1101_platform_transfer(tx, rx, rxbytes + 1u);
+    cc1101_platform_deselect();
+
     if (rc < 0) {
         return rc;
     }
-    if (length == 0 || (size_t)length + 2u > max_len || (size_t)length + 3u > 96u) {
+
+    /* 
+     * Parse the received FIFO data:
+     * rx[0] = Status byte
+     * rx[1] = Length byte
+     * rx[2] = Address byte
+     * rx[3] = First byte of payload...
+     */
+    uint8_t length = rx[1];
+    if (length == 0 || (size_t)length + 2u > (size_t)rxbytes || (size_t)length > max_len) {
+        /* Inconsistent packet length or corrupted FIFO, flush it */
         cc1101_strobe(radio, CC1101_SIDLE);
         cc1101_strobe(radio, CC1101_SFRX);
         return -3;
     }
 
-    uint8_t fifo[96];
-    rc = cc1101_read_burst(radio, CC1101_RXFIFO, fifo, (size_t)length + 2u);
-    if (rc < 0) {
-        return rc;
-    }
+    /* Copy payload data (rx[2] is the address, rx[3..] are the message characters) */
     for (uint8_t i = 0; i < length; i++) {
-        data[i] = fifo[i];
+        data[i] = rx[2 + i];
     }
+    
     if (rssi) {
-        *rssi = fifo[length];
+        *rssi = rx[2 + length];
     }
     if (lqi) {
-        *lqi = fifo[length + 1u];
+        *lqi = rx[2 + length + 1u];
     }
+
     return (int)length;
 }
 

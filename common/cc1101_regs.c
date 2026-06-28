@@ -26,7 +26,7 @@ const cc1101_reg_value_t cc1101_rf_preset[] = {
     {CC1101_MDMCFG0,  0xf8},
     {CC1101_DEVIATN,  0x47},
     {CC1101_MCSM2,    0x07},
-    {CC1101_MCSM1,    0x0c},
+    {CC1101_MCSM1,    0x0f},
     {CC1101_MCSM0,    0x18},
     {CC1101_FOCCFG,   0x16},
     {CC1101_BSCFG,    0x6c},

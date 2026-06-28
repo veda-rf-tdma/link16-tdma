@@ -15,6 +15,7 @@ int cc1101_platform_transfer(const uint8_t *tx, uint8_t *rx, size_t len);
 
 int cc1101_apply_rf_preset(cc1101_t *radio);
 int cc1101_start_rx(cc1101_t *radio);
+int cc1101_rx_bytes_available(cc1101_t *radio);
 int cc1101_send_packet(cc1101_t *radio, const uint8_t *data, size_t len);
 int cc1101_poll_packet(cc1101_t *radio, uint8_t *data, size_t max_len,
                        uint8_t *rssi, uint8_t *lqi);
