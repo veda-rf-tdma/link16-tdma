@@ -178,3 +178,39 @@ Keil uVision 평가판(Evaluation/Lite Edition)의 32KB 코드 크기 제한 에
 | **마스터 브릿지 보드**<br>(`NODE_ROLE_MASTER`) | - `tdma_app.c`<br>- `ekf.c`<br>- `tdma.c`<br>- `tdma_runtime.c`<br>- `node_table.c`<br>- `radio_metrics.c` |
 | **비행체 및 앵커 노드 보드**<br>(`NODE_ROLE_AIRCRAFT` 등) | - `usb_cdc_bridge.c`<br>- `ekf.c` (마스터 전용 EKF 알고리즘으로, 비행체/앵커 빌드 시 불필요하여 제외 권장)<br>- `node_table.c` (공용 미사용 소스로, 빌드 시 제외 권장)<br>- **ST USB 라이브러리 관련 파일 일체** (`usb_device.c`, `usbd_cdc_if.c`, `usbd_conf.c`, `usbd_cdc.c`, `usbd_core.c`, `usbd_ctlreq.c`, `usbd_ioreq.c` 등) |
 
+---
+
+## 8. DMA 및 비동기 다중 통신 구현 수칙 (체크리스트)
+
+정밀 TDMA 타이밍 환경에서 DMA와 비동기 인터럽트 통신을 안정적으로 구현하기 위해 프로젝트 전반에 걸쳐 아래 핵심 수칙을 준수해야 합니다.
+
+### 🟩 1. 변수 및 버퍼 선언 지침
+* **volatile 키워드 필수 사용:** DMA 완료 콜백 함수와 메인 루프 간 공유되는 모든 플래그/상태 변수에는 컴파일러 최적화 방지를 위해 `volatile`을 필수 사용합니다.
+  ```c
+  volatile uint8_t g_spi_tx_complete = 0;
+  volatile uint8_t g_uart_idle_flag = 0;
+  ```
+* **4바이트 메모리 정렬(Memory Alignment) 명시:** DMA 전송 시 메모리 주소 정렬 어긋남 에러를 막기 위해 통신 버퍼 배열에 4바이트 정렬을 명시합니다.
+  ```c
+  __attribute__((aligned(4))) uint8_t g_uart_rx_buffer[256];
+  ```
+
+### 🟩 2. 하드웨어 자원 및 인터럽트(NVIC) 설정 지침
+* **인터럽트 우선순위 계층화:** 다중 통신 충돌 시 정밀 타이밍(TDMA 슬롯)을 보장하기 위해 데이터 속도가 빠르고 실시간성이 높은 주변장치의 우선순위를 가장 높게(Preemption Priority 숫자를 작게) 설정합니다.
+  - **1순위 (최상위):** SPI Global Interrupt (예: Preemption Priority = 2)
+  - **2순위 (하위):** UART/USART Global Interrupt (예: Preemption Priority = 5)
+* **UART 수신 모드:** 데스크톱과의 가상 COM 포트(USART2) 연결 시, CPU 부하를 경감하기 위해 **DMA Circular 모드** 및 **IDLE Line 인터럽트** 조합 사용을 강력히 권장합니다.
+
+### 🟩 3. 데이터 경쟁(Race Condition) 방지 및 자원 격리
+* **독점권(Lock) 보장:** DMA가 메모리를 쓰고 있는 동안 CPU가 동일한 버퍼 영역을 직접 쓰거나 읽지 않도록 플래그를 제어해야 합니다.
+* **역할 분담 (인터럽트 최소화):** DMA/GPIO 콜백(ISR) 내부에서는 복잡한 패킷 파싱(Parsing)이나 딜레이 연산을 절대로 수행하지 않습니다. 콜백에서는 플래그 세팅 또는 간단한 복사만 수행하고, 실제 디코딩은 메인 루프에서 처리합니다.
+  - ex) [HAL_GPIO_EXTI_Callback](file:///c:/Users/devSh/Documents/home-lab/link16-tdma/stm32_bridge/Src/tdma_app.c#L99) 내부에서는 플래그만 전환하고, 메인 루프 [tdma_app_tick](file:///c:/Users/devSh/Documents/home-lab/link16-tdma/stm32_bridge/Src/tdma_app.c#L692)에서 패킷 처리 호출.
+* **SPI 버스 동기화:** DMA 전송이 백그라운드에서 진행 중일 때는 동일한 SPI 버스를 사용하는 다른 주변장치/레지스터 접근을 소프트웨어 락(Mutex) 등으로 완전히 차단해야 합니다.
+
+### 🟩 4. 안전장치 및 버퍼 오버플로우 방지
+* **하드코딩 금지:** `HAL_UART_Receive_DMA`, `HAL_SPI_TransmitReceive_DMA` 등 크기 지정 매개변수 호출 시 버퍼 크기 불일치 오염을 방지하기 위해 `sizeof()` 연산자를 명시합니다.
+* **더블 버퍼링(Ping-Pong Buffer) 구조 검토:** 수신 데이터 유입 빈도가 매우 높은 환경에서는 `HAL_UARTEx_ReceiveToIdle_DMA` 등을 이용한 핑퐁 버퍼링 기법을 적용합니다.
+* **DMA 에러 복구 콜백 등록:** DMA 오류로 채널이 락업되는 것을 방지하기 위해 `HAL_UART_ErrorCallback` 및 `HAL_SPI_ErrorCallback`을 구현하여 비상 시 채널을 자동 재부팅(Flush & Restart)합니다.
+* **임계 구역(Critical Section) 최소화:** 지터 방지를 위해 인터럽트 완전 차단(`__disable_irq()`) 구간은 10us 이내로 최소화합니다.
+
+
