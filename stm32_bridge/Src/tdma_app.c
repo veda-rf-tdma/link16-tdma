@@ -24,6 +24,13 @@ extern I2C_HandleTypeDef hi2c1;
 #endif
 
 /* Robust fallbacks if CubeMX user labels are missing */
+#if defined(GDO0_Pin) && !defined(CC1101_GDO0_Pin)
+#define CC1101_GDO0_Pin GDO0_Pin
+#endif
+#if defined(GDO0_GPIO_Port) && !defined(CC1101_GDO0_GPIO_Port)
+#define CC1101_GDO0_GPIO_Port GDO0_GPIO_Port
+#endif
+
 #ifndef CC1101_GDO0_Pin
 #define CC1101_GDO0_Pin GPIO_PIN_0
 #endif
@@ -468,6 +475,14 @@ static void transmit_slot_packet(void)
     size_t tx_len = cc1101_wrap_variable_packet(0x00, tdma_payload, tx_payload_len, tx_buf, sizeof(tx_buf));
     if (tx_len > 0) {
         cc1101_send_packet(&radio, tx_buf, tx_len);
+        
+        static uint16_t last_log_frame = 0xffff;
+        if (last_log_frame == 0xffff || (packet.frame_no - last_log_frame >= 50)) {
+            last_log_frame = packet.frame_no;
+            char periodic_log[64];
+            snprintf(periodic_log, sizeof(periodic_log), "INFO: TDMA TX in Slot %d (Frame %d)\r\n", packet.slot_no, packet.frame_no);
+            log_telemetry(periodic_log);
+        }
         
         /* Print debug log only for the very first transmission to prevent slot timing disruption */
         static int first_tx_logged = 0;

@@ -47,7 +47,7 @@ typedef struct {
     tdma_slot_plan_t plan;
     uint8_t channel_set;
     uint8_t radio_started;
-    uint8_t gdo0_pending;
+    volatile uint8_t gdo0_pending;
 } tdma_runtime_t;
 
 void tdma_runtime_init(tdma_runtime_t *runtime, uint8_t local_node_id);

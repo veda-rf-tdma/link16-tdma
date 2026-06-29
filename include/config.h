@@ -57,6 +57,6 @@
 #define CC1101_TX_POWER_DBM   0.0
 #define CC1101_RSSI_OFFSET_DB 74.0
 #define RADIO_PATH_LOSS_EXPONENT 2.0
-#define TDMA_BEACON_SYNC_DELAY_US 14000u /* Compensation for serial + RF propagation delay (14ms) */
+#define TDMA_BEACON_SYNC_DELAY_US 4000u /* Compensation for serial + RF propagation delay (4ms) */
 
 #endif
