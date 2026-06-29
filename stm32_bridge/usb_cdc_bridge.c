@@ -6,8 +6,23 @@
 #include <string.h>
 #include <stdio.h>
 
+#define CC1101_READ 0x80u
+#define CC1101_BURST 0x40u
+#define CC1101_STATUS_MARCSTATE 0x35u
+
+static volatile uint8_t g_handshake_done = 0;
 static uint8_t rx_buf[128];
-static int rx_idx = 0;
+static volatile int rx_idx = 0;
+
+#define UART_RX_DMA_BUF_SIZE 256
+__attribute__((aligned(4))) static uint8_t g_uart_rx_dma_buf[UART_RX_DMA_BUF_SIZE];
+__attribute__((aligned(4))) static uint8_t g_uart_tx_dma_buf[256];
+
+volatile uint8_t g_uart_tx_complete = 1;
+volatile uint8_t g_uart_rx_ready = 0;
+static uint16_t last_rx_pos = 0;
+
+int usb_cdc_bridge_send_dma(const uint8_t *data, uint16_t len);
 
 enum {
     BRIDGE_MAGIC = 0xa5u,
@@ -54,20 +69,46 @@ static int bridge_error(uint8_t code, uint8_t *out, size_t out_len)
     return (int)bridge_build_frame(BRIDGE_EVT_ERROR, &code, 1, out, out_len);
 }
 
+int usb_cdc_bridge_send_dma(const uint8_t *data, uint16_t len)
+{
+    extern UART_HandleTypeDef huart2;
+    uint32_t timeout = 500000;
+    while (!g_uart_tx_complete && --timeout) {
+        __asm("NOP");
+    }
+    if (len > sizeof(g_uart_tx_dma_buf)) {
+        return -1;
+    }
+    g_uart_tx_complete = 0;
+    memcpy(g_uart_tx_dma_buf, data, len);
+    if (HAL_UART_Transmit_DMA(&huart2, g_uart_tx_dma_buf, len) != HAL_OK) {
+        g_uart_tx_complete = 1;
+        return -1;
+    }
+    return 0;
+}
+
 int usb_cdc_bridge_init(void)
 {
-    /* Disable USART2 interrupts to prevent HAL from automatically clearing RXNE */
-    HAL_NVIC_DisableIRQ(USART2_IRQn);
+    extern UART_HandleTypeDef huart2;
+
+    // Enable USART2 interrupts
+    HAL_NVIC_SetPriority(USART2_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
 
     int rc = cc1101_apply_rf_preset(&bridge_radio);
-    extern UART_HandleTypeDef huart2;
     if (rc >= 0) {
         cc1101_set_tx_power(&bridge_radio, CC1101_TX_POWER_DBM);
         /* Turn on Debug LED (LD2 on Nucleo board) to show successful startup */
         HAL_GPIO_WritePin(Debug_LED_GPIO_Port, Debug_LED_Pin, GPIO_PIN_SET);
-        HAL_UART_Transmit(&huart2, (uint8_t *)"MASTER_BOOT_OK\r\n", 16, 100);
+        
+        // Start UART Receive DMA with IDLE detection
+        last_rx_pos = 0;
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_uart_rx_dma_buf, UART_RX_DMA_BUF_SIZE);
+        
+        usb_cdc_bridge_send_dma((const uint8_t *)"MASTER_BOOT_OK\r\n", 16);
     } else {
-        HAL_UART_Transmit(&huart2, (uint8_t *)"ERROR: Master CC1101 init failed\r\n", 34, 100);
+        usb_cdc_bridge_send_dma((const uint8_t *)"ERROR: Master CC1101 init failed\r\n", 34);
     }
     return rc;
 }
@@ -85,13 +126,13 @@ int usb_cdc_bridge_parse(const uint8_t *in, size_t in_len, uint8_t *out, size_t 
     switch (type) {
     case BRIDGE_CMD_START_RX:
         rc = cc1101_start_rx(&bridge_radio);
+        if (rc >= 0) {
+            g_handshake_done = 1;
+        }
         return rc < 0 ? bridge_error(0x21, out, out_len) :
                         (int)bridge_build_frame(BRIDGE_EVT_TX_DONE, 0, 0, out, out_len);
     case BRIDGE_CMD_TX_PACKET:
         rc = cc1101_send_packet(&bridge_radio, payload, payload_len);
-        /* Wait 10ms for RF transmission to finish before manually forcing RX mode */
-        HAL_Delay(10);
-        cc1101_start_rx(&bridge_radio);
         return rc < 0 ? bridge_error(0x22, out, out_len) :
                         (int)bridge_build_frame(BRIDGE_EVT_TX_DONE, 0, 0, out, out_len);
     case BRIDGE_CMD_GET_STATUS: {
@@ -105,11 +146,17 @@ int usb_cdc_bridge_parse(const uint8_t *in, size_t in_len, uint8_t *out, size_t 
 
 int usb_cdc_bridge_poll_radio(uint8_t *out, size_t out_len)
 {
-    uint8_t radio_frame[96];
+    __attribute__((aligned(4))) uint8_t radio_frame[96];
     uint8_t rssi = 0;
     uint8_t lqi = 0;
     int n = cc1101_poll_packet(&bridge_radio, radio_frame, sizeof(radio_frame), &rssi, &lqi);
-    if (n <= 0) {
+    if (n < 0) {
+        static char err_log[64];
+        int err_len = snprintf(err_log, sizeof(err_log), "INFO: Master poll error %d\r\n", n);
+        usb_cdc_bridge_send_dma((const uint8_t *)err_log, (uint16_t)err_len);
+        return 0;
+    }
+    if (n == 0) {
         return 0;
     }
 
@@ -133,7 +180,8 @@ int usb_cdc_bridge_poll_radio(uint8_t *out, size_t out_len)
         snprintf(rx_log, sizeof(rx_log), "INFO: Master RX BAD | Len=%d | rc=%d | RSSI_RAW=0x%02X | LQI=0x%02X | Hex: %s\r\n",
                  n, rc, rssi, lqi, hex_str);
     }
-    HAL_UART_Transmit(&huart2, (uint8_t *)rx_log, (uint16_t)strlen(rx_log), 100);
+    /* Commented out debug print to prevent UART DMA collision with bridge frame transmission */
+    /* usb_cdc_bridge_send_dma((const uint8_t *)rx_log, (uint16_t)strlen(rx_log)); */
 
     uint8_t payload[100];
     if ((size_t)n + 2u > sizeof(payload)) {
@@ -198,7 +246,7 @@ void usb_cdc_bridge_tick(void)
             tx_offset += snprintf(tx_log + tx_offset, sizeof(tx_log) - tx_offset, " %02X", tx_buf[i]);
         }
         snprintf(tx_log + tx_offset, sizeof(tx_log) - tx_offset, "\r\n");
-        HAL_UART_Transmit(&huart2, (uint8_t *)tx_log, (uint16_t)strlen(tx_log), 100);
+        usb_cdc_bridge_send_dma((const uint8_t *)tx_log, (uint16_t)strlen(tx_log));
     }
     return;
 #endif
@@ -210,39 +258,51 @@ void usb_cdc_bridge_tick(void)
         hb_cnt = 0;
     }
 
-    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE) || 
-        __HAL_UART_GET_FLAG(&huart2, UART_FLAG_NE)  ||
-        __HAL_UART_GET_FLAG(&huart2, UART_FLAG_FE)  ||
-        __HAL_UART_GET_FLAG(&huart2, UART_FLAG_PE)) {
-        volatile uint32_t sr = huart2.Instance->SR;
-        volatile uint32_t dr = huart2.Instance->DR;
-        (void)sr;
-        (void)dr;
-    }
-    while (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_RXNE)) {
-        uint8_t c = (uint8_t)(huart2.Instance->DR & 0xFF);
-        rx_buf[rx_idx++] = c;
-        if (rx_idx >= 128) rx_idx = 0;
+    // Auto-restart DMA if stopped or not initialized
+    if (huart2.RxState == HAL_UART_STATE_READY) {
+        last_rx_pos = 0;
+        HAL_UARTEx_ReceiveToIdle_DMA(&huart2, g_uart_rx_dma_buf, UART_RX_DMA_BUF_SIZE);
     }
     
-    while (rx_idx >= 1) {
+    while (1) {
+        int rx_len_snap;
+        __disable_irq();
+        rx_len_snap = rx_idx;
+        __enable_irq();
+        
+        if (rx_len_snap < 1) {
+            break;
+        }
+        
         int start = -1;
+        __disable_irq();
         for (int i = 0; i < rx_idx; i++) {
             if (rx_buf[i] == 0xA5) {
                 start = i;
                 break;
             }
         }
+        __enable_irq();
+        
         if (start < 0) {
+            __disable_irq();
             rx_idx = 0;
+            __enable_irq();
             break;
         }
+        
         if (start > 0) {
+            __disable_irq();
             memmove(rx_buf, rx_buf + start, rx_idx - start);
             rx_idx -= start;
+            __enable_irq();
         }
         
-        if (rx_idx < 3) {
+        int snap_idx;
+        __disable_irq();
+        snap_idx = rx_idx;
+        __enable_irq();
+        if (snap_idx < 3) {
             break;
         }
         
@@ -252,13 +312,18 @@ void usb_cdc_bridge_tick(void)
         
         // Sane check: type must be a valid bridge command, and length must fit in max frame.
         if (type < 1 || type > 4 || expected_len > 128) {
-            // Noise byte false start. Discard the first byte and retry.
+            __disable_irq();
             memmove(rx_buf, rx_buf + 1, rx_idx - 1);
             rx_idx -= 1;
+            __enable_irq();
             continue;
         }
         
-        if (rx_idx < expected_len) {
+        int snap_idx2;
+        __disable_irq();
+        snap_idx2 = rx_idx;
+        __enable_irq();
+        if (snap_idx2 < expected_len) {
             break; // Wait for the remaining bytes
         }
         
@@ -268,14 +333,18 @@ void usb_cdc_bridge_tick(void)
             uint8_t response[128];
             int resp_len = usb_cdc_bridge_parse(rx_buf, expected_len, response, sizeof(response));
             if (resp_len > 0) {
-                HAL_UART_Transmit(&huart2, response, (uint16_t)resp_len, 100);
+                usb_cdc_bridge_send_dma(response, (uint16_t)resp_len);
             }
+            __disable_irq();
             memmove(rx_buf, rx_buf + expected_len, rx_idx - expected_len);
             rx_idx -= expected_len;
+            __enable_irq();
         } else {
             // CRC mismatch. The A5 byte was a false start. Discard 1 byte and retry.
+            __disable_irq();
             memmove(rx_buf, rx_buf + 1, rx_idx - 1);
             rx_idx -= 1;
+            __enable_irq();
         }
     }
     
@@ -286,7 +355,70 @@ void usb_cdc_bridge_tick(void)
         uint8_t tx_buf[128];
         int tx_len = usb_cdc_bridge_poll_radio(tx_buf, sizeof(tx_buf));
         if (tx_len > 0) {
-            HAL_UART_Transmit(&huart2, tx_buf, (uint16_t)tx_len, 100); 
+            usb_cdc_bridge_send_dma(tx_buf, (uint16_t)tx_len); 
         }
     }
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    if (huart->Instance == USART2) {
+        uint16_t len = 0;
+        if (Size > last_rx_pos) {
+            len = Size - last_rx_pos;
+            for (uint16_t i = 0; i < len; i++) {
+                rx_buf[rx_idx] = g_uart_rx_dma_buf[last_rx_pos + i];
+                rx_idx++;
+                if (rx_idx >= sizeof(rx_buf)) rx_idx = 0;
+            }
+        } else if (Size < last_rx_pos) {
+            len = UART_RX_DMA_BUF_SIZE - last_rx_pos;
+            for (uint16_t i = 0; i < len; i++) {
+                rx_buf[rx_idx] = g_uart_rx_dma_buf[last_rx_pos + i];
+                rx_idx++;
+                if (rx_idx >= sizeof(rx_buf)) rx_idx = 0;
+            }
+            len = Size;
+            for (uint16_t i = 0; i < len; i++) {
+                rx_buf[rx_idx] = g_uart_rx_dma_buf[i];
+                rx_idx++;
+                if (rx_idx >= sizeof(rx_buf)) rx_idx = 0;
+            }
+        }
+        last_rx_pos = Size;
+        if (last_rx_pos >= UART_RX_DMA_BUF_SIZE) {
+            last_rx_pos = 0;
+        }
+        g_uart_rx_ready = 1;
+    }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        g_uart_tx_complete = 1;
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART2) {
+        g_uart_tx_complete = 1;
+        HAL_UART_DMAStop(huart);
+        last_rx_pos = 0;
+        HAL_UARTEx_ReceiveToIdle_DMA(huart, g_uart_rx_dma_buf, UART_RX_DMA_BUF_SIZE);
+    }
+}
+
+/* 
+ * USART2 RX DMA and Idle line detection requires the USART2 global interrupt.
+ * We define it here as a strong symbol to override the weak startup vector.
+ * If you enable "USART2 global interrupt" in CubeMX NVIC settings later,
+ * it will generate duplicate symbol USART2_IRQHandler in stm32f4xx_it.c,
+ * in which case you can comment out the definition below.
+ */
+void USART2_IRQHandler(void)
+{
+    extern UART_HandleTypeDef huart2;
+    HAL_UART_IRQHandler(&huart2);
 }
