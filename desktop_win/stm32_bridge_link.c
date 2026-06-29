@@ -235,14 +235,22 @@ int bridge_poll_packet_meta(stm32_bridge_link_t *link, uint8_t *data, size_t max
             }
         }
 
-        // If no Magic byte is found, discard all bytes
+        // If no Magic byte is found, print all bytes and discard
         if (start < 0) {
+            for (size_t i = 0; i < rx_idx; i++) {
+                putchar(rx_buf[i]);
+            }
+            fflush(stdout);
             rx_idx = 0;
             break;
         }
 
-        // Shift buffer to align start with BRIDGE_MAGIC
+        // Shift buffer to align start with BRIDGE_MAGIC, printing non-magic bytes
         if (start > 0) {
+            for (int i = 0; i < start; i++) {
+                putchar(rx_buf[i]);
+            }
+            fflush(stdout);
             memmove(rx_buf, rx_buf + start, rx_idx - (size_t)start);
             rx_idx -= (size_t)start;
         }
