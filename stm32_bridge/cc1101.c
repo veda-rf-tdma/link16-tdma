@@ -4,10 +4,17 @@
 #include <stdio.h>
 
 extern SPI_HandleTypeDef hspi1;
+volatile uint8_t g_spi_tx_complete = 0;
+volatile uint8_t g_spi_busy = 0;
 
 #ifndef CC1101_CSN_Pin
 #define CC1101_CSN_Pin GPIO_PIN_4
 #define CC1101_CSN_GPIO_Port GPIOA
+#endif
+
+#ifndef GDO0_Pin
+#define GDO0_Pin GPIO_PIN_0
+#define GDO0_GPIO_Port GPIOB
 #endif
 
 enum {
@@ -26,23 +33,24 @@ static int cc1101_transfer_selected(const uint8_t *tx, uint8_t *rx, size_t len)
 
 static int cc1101_strobe(cc1101_t *radio, uint8_t strobe)
 {
-    uint8_t rx = 0;
+    __attribute__((aligned(4))) uint8_t tx_strobe = strobe;
+    __attribute__((aligned(4))) uint8_t rx_strobe = 0;
     (void)radio;
-    return cc1101_transfer_selected(&strobe, &rx, 1);
+    return cc1101_transfer_selected(&tx_strobe, &rx_strobe, 1);
 }
 
 static int cc1101_write_reg(cc1101_t *radio, uint8_t addr, uint8_t value)
 {
-    uint8_t tx[2] = {addr, value};
-    uint8_t rx[2] = {0, 0};
+    __attribute__((aligned(4))) uint8_t tx[4] = {addr, value, 0, 0};
+    __attribute__((aligned(4))) uint8_t rx[4] = {0, 0, 0, 0};
     (void)radio;
-    return cc1101_transfer_selected(tx, rx, sizeof(tx));
+    return cc1101_transfer_selected(tx, rx, 2);
 }
 
 static int cc1101_write_burst(cc1101_t *radio, uint8_t addr, const uint8_t *data, size_t len)
 {
-    uint8_t tx[96];
-    uint8_t rx[96];
+    __attribute__((aligned(4))) uint8_t tx[96];
+    __attribute__((aligned(4))) uint8_t rx[96];
     (void)radio;
     if (!data || len + 1u > sizeof(tx)) {
         return -1;
@@ -56,10 +64,10 @@ static int cc1101_write_burst(cc1101_t *radio, uint8_t addr, const uint8_t *data
 
 static int cc1101_read_status(cc1101_t *radio, uint8_t addr, uint8_t *value)
 {
-    uint8_t tx[2] = {(uint8_t)(addr | CC1101_READ | CC1101_BURST), 0};
-    uint8_t rx[2] = {0, 0};
+    __attribute__((aligned(4))) uint8_t tx[4] = {(uint8_t)(addr | CC1101_READ | CC1101_BURST), 0, 0, 0};
+    __attribute__((aligned(4))) uint8_t rx[4] = {0, 0, 0, 0};
     (void)radio;
-    int rc = cc1101_transfer_selected(tx, rx, sizeof(tx));
+    int rc = cc1101_transfer_selected(tx, rx, 2);
     if (rc < 0) {
         return rc;
     }
@@ -69,10 +77,10 @@ static int cc1101_read_status(cc1101_t *radio, uint8_t addr, uint8_t *value)
 
 static int cc1101_read_reg(cc1101_t *radio, uint8_t addr, uint8_t *value)
 {
-    uint8_t tx[2] = {(uint8_t)(addr | CC1101_READ), 0};
-    uint8_t rx[2] = {0, 0};
+    __attribute__((aligned(4))) uint8_t tx[4] = {(uint8_t)(addr | CC1101_READ), 0, 0, 0};
+    __attribute__((aligned(4))) uint8_t rx[4] = {0, 0, 0, 0};
     (void)radio;
-    int rc = cc1101_transfer_selected(tx, rx, sizeof(tx));
+    int rc = cc1101_transfer_selected(tx, rx, 2);
     if (rc < 0) {
         return rc;
     }
@@ -82,8 +90,8 @@ static int cc1101_read_reg(cc1101_t *radio, uint8_t addr, uint8_t *value)
 
 static int cc1101_read_burst(cc1101_t *radio, uint8_t addr, uint8_t *data, size_t len)
 {
-    uint8_t tx[96];
-    uint8_t rx[96];
+    __attribute__((aligned(4))) uint8_t tx[96];
+    __attribute__((aligned(4))) uint8_t rx[96];
     (void)radio;
     if (!data || len + 1u > sizeof(tx)) {
         return -1;
@@ -190,12 +198,24 @@ int cc1101_poll_packet(cc1101_t *radio, uint8_t *data, size_t max_len,
     }
 
     /* 
+     * If GDO0 is HIGH, the packet is still being received over the air.
+     * Wait until GDO0 falls LOW (end of packet) before reading the FIFO 
+     * to avoid reading a partial packet destructively.
+     * This is only enabled on the Master node (using polling).
+     */
+#if defined(NODE_ROLE_MASTER)
+    if (HAL_GPIO_ReadPin(GDO0_GPIO_Port, GDO0_Pin) == GPIO_PIN_SET) {
+        return 0;
+    }
+#endif
+
+    /* 
      * To prevent SPI clock glitches and byte-shift issues caused by 
      * multiple back-to-back HAL_SPI_TransmitReceive calls, we read the 
      * entire RX FIFO in ONE single continuous SPI transaction.
      */
-    uint8_t tx[96];
-    uint8_t rx[96];
+    __attribute__((aligned(4))) uint8_t tx[96];
+    __attribute__((aligned(4))) uint8_t rx[96];
     if (rxbytes > sizeof(tx) - 1u) {
         rxbytes = sizeof(tx) - 1u;
     }
@@ -296,6 +316,42 @@ void cc1101_platform_delay_ms(uint32_t ms)
 
 int cc1101_platform_transfer(const uint8_t *tx, uint8_t *rx, size_t len)
 {
-    HAL_StatusTypeDef rc = HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)tx, rx, (uint16_t)len, 100);
-    return rc == HAL_OK ? 0 : -1;
+    if (g_spi_busy) {
+        return -2;
+    }
+    g_spi_busy = 1;
+    g_spi_tx_complete = 0;
+
+    HAL_StatusTypeDef rc = HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t *)tx, rx, (uint16_t)len);
+    if (rc != HAL_OK) {
+        g_spi_busy = 0;
+        return -1;
+    }
+
+    uint32_t timeout = 500000;
+    while (!g_spi_tx_complete && --timeout) {
+        __asm("NOP");
+    }
+
+    g_spi_busy = 0;
+
+    if (timeout == 0) {
+        HAL_SPI_DMAStop(&hspi1);
+        return -1;
+    }
+    return 0;
+}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance == SPI1) {
+        g_spi_tx_complete = 1;
+    }
+}
+
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance == SPI1) {
+        g_spi_tx_complete = 1;
+    }
 }
